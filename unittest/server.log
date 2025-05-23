@@ -1,0 +1,111 @@
+2025-05-10 19:51:53 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 19:51:53 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 19:51:53 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 19:51:53 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 30
+2025-05-10 20:01:39 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:02:09 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:02:09 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:02:09 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:02:09 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 30
+2025-05-10 20:03:03 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:03:03 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:03:03 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:03:03 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 30
+2025-05-10 20:11:30 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:11:30 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:11:30 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:11:30 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 30
+2025-05-10 20:13:58 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:13:58 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:13:58 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:13:58 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 30
+2025-05-10 20:14:24 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:14:24 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:14:24 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:14:24 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 30
+2025-05-10 20:14:49 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:14:49 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:14:49 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:14:49 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 200 184
+2025-05-10 20:16:05 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:16:05 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:16:05 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:16:05 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 200 184
+2025-05-10 20:16:14 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:16:14 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 120
+2025-05-10 20:16:14 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:16:14 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 200 184
+2025-05-10 20:17:30 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:17:30 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 200 184
+2025-05-10 20:34:10 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:34:10 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 200 184
+2025-05-10 20:34:52 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:34:52 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 54
+2025-05-10 20:37:11 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:37:11 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 184
+2025-05-10 20:37:11 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:37:11 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 401 54
+2025-05-10 20:45:56 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-10 20:45:56 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/login HTTP/1.1" 200 184
+2025-05-10 20:45:56 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-10 20:45:56 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/students?name=%E5%BC%A0%E4%B8%89 HTTP/1.1" 200 184
+2025-05-11 14:48:06 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-11 14:48:06 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/auth/public-key HTTP/1.1" 200 654
+2025-05-11 14:48:22 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-11 14:48:22 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-16 21:26:48 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:26:48 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-16 21:26:48 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-16 21:26:48 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/register HTTP/1.1" 409 45
+2025-05-16 21:28:04 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:28:04 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/auth/public-key HTTP/1.1" 200 654
+2025-05-16 21:28:16 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:28:16 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-16 21:28:23 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:28:23 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 400 41
+2025-05-16 21:28:29 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:28:29 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-16 21:28:29 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-16 21:28:29 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/auth/register HTTP/1.1" 409 45
+2025-05-16 21:40:38 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:40:38 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-16 21:43:14 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:43:14 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 500 34
+2025-05-16 21:43:35 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:43:35 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-16 21:45:25 - DEBUG - Starting new HTTP connection (1): 127.0.0.1:8080
+2025-05-16 21:45:25 - DEBUG - http://127.0.0.1:8080 "GET http://localhost:5000/api/auth/public-key HTTP/1.1" 200 654
+2025-05-16 21:45:25 - DEBUG - Resetting dropped connection: 127.0.0.1
+2025-05-16 21:45:25 - DEBUG - http://127.0.0.1:8080 "POST http://localhost:5000/api/verify_invite HTTP/1.1" 200 356
+2025-05-17 09:47:26 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 09:47:26 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 09:47:26 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 09:47:26 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 401 30
+2025-05-17 09:47:54 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 09:47:54 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 09:47:54 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 09:47:54 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 401 30
+2025-05-17 09:50:22 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 09:50:22 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 09:50:22 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 09:50:22 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 401 30
+2025-05-17 11:08:58 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 11:08:58 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 11:08:58 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 11:08:58 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 500 34
+2025-05-17 11:13:27 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 11:13:27 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 11:13:27 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 11:13:28 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 200 356
+2025-05-17 11:36:57 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 11:36:57 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 11:36:57 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 11:36:57 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 400 43
+2025-05-17 11:37:24 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 11:37:24 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 11:37:24 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 11:37:24 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 400 43
+2025-05-17 11:38:08 - DEBUG - Starting new HTTP connection (1): localhost:5000
+2025-05-17 11:38:08 - DEBUG - http://localhost:5000 "GET /api/auth/public-key HTTP/1.1" 200 654
+2025-05-17 11:38:08 - DEBUG - Resetting dropped connection: localhost
+2025-05-17 11:38:08 - DEBUG - http://localhost:5000 "POST /api/verify_invite HTTP/1.1" 400 43
