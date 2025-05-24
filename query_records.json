@@ -167,3 +167,38 @@
 {"timestamp": "2025-05-23T18:47:38.462250", "account": "lpy", "ip": "127.0.0.1", "action": "admin_get_online_users", "query": {"admin_account": "lpy"}, "result_count": 0}
 {"timestamp": "2025-05-23T18:47:43.642356", "account": "lpy", "ip": "127.0.0.1", "action": "admin_force_logout_success", "query": {"admin_account": "lpy", "target_account": "奶奶手机"}, "result_count": 1}
 {"timestamp": "2025-05-23T18:47:43.783991", "account": "lpy", "ip": "127.0.0.1", "action": "admin_get_online_users", "query": {"admin_account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T19:41:42.094453", "account": "lpy", "ip": "127.0.0.1", "action": "get_system_status", "query": {"account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T19:41:42.490065", "account": "lpy", "ip": "127.0.0.1", "action": "admin_get_online_users", "query": {"admin_account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T19:42:06.076119", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 17}
+{"timestamp": "2025-05-23T20:26:35.636359", "account": "lpy", "ip": "127.0.0.1", "action": "login_success", "query": {"account": "lpy"}, "result_count": 1}
+{"timestamp": "2025-05-23T20:26:39.186119", "account": "lpy", "ip": "127.0.0.1", "action": "get_system_status", "query": {"account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T20:26:39.341285", "account": "lpy", "ip": "127.0.0.1", "action": "admin_get_online_users", "query": {"admin_account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T20:26:40.870437", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 18}
+{"timestamp": "2025-05-23T20:26:43.194590", "account": "lpy", "ip": "127.0.0.1", "action": "get_system_status", "query": {"account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T20:26:43.363333", "account": "lpy", "ip": "127.0.0.1", "action": "admin_get_online_users", "query": {"admin_account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T20:34:55.163740", "account": "lpy", "ip": "127.0.0.1", "action": "login_failed_password", "query": {"account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-23T20:35:02.989996", "account": "lpy", "ip": "127.0.0.1", "action": "login_failed_password", "query": {"account": "lpy"}, "result_count": 0}
+{"timestamp": "2025-05-24T13:46:03.905511", "account": "lpy", "ip": "127.0.0.1", "action": "login_success", "query": {"account": "lpy"}, "result_count": 1}
+{"timestamp": "2025-05-24T13:46:09.645054", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T13:46:14.988480", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T13:52:13.917995", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:08:15.312059", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:12:14.106703", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:15:35.640289", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:15:50.322982", "account": "lpy", "ip": "127.0.0.1", "action": "query_students", "query": {"name": "1", "class": "1"}, "result_count": 0}
+{"timestamp": "2025-05-24T14:15:53.294800", "account": "lpy", "ip": "127.0.0.1", "action": "query_students", "query": {"name": "1", "class": ""}, "result_count": 1}
+{"timestamp": "2025-05-24T14:18:06.873770", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:18:44.858892", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:18:53.230460", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:20:58.665413", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:21:00.779738", "account": "lpy", "ip": "127.0.0.1", "action": "superadmin_get_blacklist_ips", "query": {}, "result_count": 0}
+{"timestamp": "2025-05-24T14:21:35.814254", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:21:37.306705", "account": "lpy", "ip": "127.0.0.1", "action": "superadmin_get_blacklist_ips", "query": {}, "result_count": 0}
+{"timestamp": "2025-05-24T14:21:38.489222", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 21}
+{"timestamp": "2025-05-24T14:21:39.851212", "account": "lpy", "ip": "127.0.0.1", "action": "superadmin_get_blacklist_ips", "query": {}, "result_count": 0}
+{"timestamp": "2025-05-24T14:28:01.165352", "account": "lpy", "ip": "127.0.0.1", "action": "login_success", "query": {"account": "lpy"}, "result_count": 1}
+{"timestamp": "2025-05-24T14:28:04.359561", "account": "lpy", "ip": "127.0.0.1", "action": "superadmin_get_blacklist_ips", "query": {}, "result_count": 0}
+{"timestamp": "2025-05-24T14:28:15.151741", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 22}
+{"timestamp": "2025-05-24T14:28:17.138079", "account": "lpy", "ip": "127.0.0.1", "action": "superadmin_get_blacklist_ips", "query": {}, "result_count": 0}
+{"timestamp": "2025-05-24T14:28:29.815473", "account": "lpy", "ip": "127.0.0.1", "action": "get_login_records", "query": {"account": "lpy"}, "result_count": 22}
+{"timestamp": "2025-05-24T14:28:38.294117", "account": "lpy", "ip": "127.0.0.1", "action": "query_students", "query": {"name": "1", "class": ""}, "result_count": 1}

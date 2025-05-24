@@ -92,6 +92,7 @@ NONCE_CACHE_EXPIRY_MS = 5 * 60 * 1000  # 5分钟Nonce有效期
 # 结构: {token: {"account": str, "role": str, "expiry": datetime}}
 TOKENS = {}
 TOKEN_EXPIRY_MINUTES = 60  # Token有效期60分钟
+SUPERADMIN_ROLE = 'superadmin'
 ADMIN_ROLE = 'admin'
 USER_ROLE = 'user'
 
@@ -450,6 +451,11 @@ def require_auth(f):
             logging.warning(f"无效的IP地址格式: {client_ip}")
             raise SecurityException("Invalid IP address format", 400)
         
+        # 检查IP是否在黑名单中
+        if client_ip in BLACKLIST_IPS:
+            log_suspicious_activity(client_ip, "blacklisted_access_attempt", "黑名单IP尝试访问")
+            raise SecurityException("Access denied: IP is blacklisted", 403)
+        
         # 检查IP是否被锁定
         if check_login_attempts(client_ip):
             log_suspicious_activity(client_ip, "blocked_access_attempt", "尝试在锁定期间访问")
@@ -633,9 +639,20 @@ def require_admin(f):
     """Admin role validation decorator"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not hasattr(g, 'role') or g.role != ADMIN_ROLE:
+        if not hasattr(g, 'role') or g.role not in [ADMIN_ROLE, SUPERADMIN_ROLE]:
             logging.warning(f"Admin access denied for user {g.account if hasattr(g, 'account') else 'unknown'} to {request.path}")
             raise SecurityException("Administrator privileges required", 403)
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def require_superadmin(f):
+    """Super admin role validation decorator"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not hasattr(g, 'role') or g.role != SUPERADMIN_ROLE:
+            logging.warning(f"Super admin access denied for user {g.account if hasattr(g, 'account') else 'unknown'} to {request.path}")
+            raise SecurityException("Super administrator privileges required", 403)
         return f(*args, **kwargs)
     return decorated_function
 
@@ -862,6 +879,12 @@ def handle_register():
             log_query(account, "register_failed_invalid_device_code_format",
                       {"account": account, "device_code": device_code}, 0, client_ip)
             raise SecurityException("无效设备码格式", 400)
+            
+        # 验证密码强度
+        if not re.match(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z\d]{6,}$', password):
+            log_query(account, "register_failed_password_strength",
+                      {"account": account}, 0, client_ip)
+            raise SecurityException("密码必须包含大小写字母和数字，且长度至少为6位", 400)
 
         # 验证邀请码有效性 (针对传入的device_code)
         try:
@@ -1133,6 +1156,59 @@ def update_password():
     except Exception as e:
         logging.error(f"修改密码异常: {str(e)}", exc_info=True)
         raise SecurityException("修改密码过程发生错误", 500)
+
+
+@app.route('/api/auth/check-token', methods=['POST'])
+def check_token():
+    """检查token是否有效（不需要认证装饰器）"""
+    try:
+        client_ip = request.headers.get('X-Client-IP', request.remote_addr)
+        
+        # 获取请求头中的token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({
+                "valid": False,
+                "message": "Missing or invalid Authorization header"
+            }), 401
+
+        token = auth_header[7:]  # 去掉'Bearer '前缀
+
+        # 验证token
+        if token not in TOKENS:
+            return jsonify({
+                "valid": False,
+                "message": "Invalid or expired token"
+            }), 401
+
+        token_data = TOKENS[token]
+        current_time = datetime.now()
+        
+        if current_time > token_data["expiry"]:
+            # 清理过期token
+            del TOKENS[token]
+            return jsonify({
+                "valid": False,
+                "message": "Token expired"
+            }), 401
+
+        # Token有效，返回剩余时间
+        remaining_seconds = int((token_data["expiry"] - current_time).total_seconds())
+        
+        return jsonify({
+            "valid": True,
+            "message": "Token is valid",
+            "expires_in": remaining_seconds,
+            "account": token_data["account"],
+            "role": token_data.get("role", USER_ROLE)
+        })
+        
+    except Exception as e:
+        logging.error(f"Token check failed: {str(e)}")
+        return jsonify({
+            "valid": False,
+            "message": "Token check failed"
+        }), 500
 
 
 @app.route('/api/auth/refresh-token', methods=['POST'])
@@ -1800,8 +1876,185 @@ def cleanup_expired_tokens():
         logging.info(f"Cleaned up {len(expired_tokens)} expired tokens")
 
 
+# 黑名单IP存储
+BLACKLIST_IPS = set()
+BLACKLIST_FILE = "blacklist_ips.json"
+
+# 加载黑名单IP
+def load_blacklist_ips():
+    """加载黑名单IP"""
+    global BLACKLIST_IPS
+    try:
+        if os.path.exists(BLACKLIST_FILE):
+            with open(BLACKLIST_FILE, 'r') as f:
+                BLACKLIST_IPS = set(json.load(f))
+    except Exception as e:
+        logging.error(f"Failed to load blacklist IPs: {str(e)}")
+        BLACKLIST_IPS = set()
+
+# 保存黑名单IP
+def save_blacklist_ips():
+    """保存黑名单IP"""
+    try:
+        with open(BLACKLIST_FILE, 'w') as f:
+            json.dump(list(BLACKLIST_IPS), f)
+    except Exception as e:
+        logging.error(f"Failed to save blacklist IPs: {str(e)}")
+
+# 超级管理员功能：激活管理员
+@app.route('/api/superadmin/activate-admin', methods=['POST'])
+@require_auth
+@require_token
+@require_superadmin
+def activate_admin():
+    """激活管理员账号"""
+    try:
+        superadmin_account = g.account
+        client_ip = g.client_ip
+        
+        # 解密请求数据
+        encrypted_data = request.json.get('data')
+        if not encrypted_data:
+            raise SecurityException("Missing encrypted data", 400)
+        
+        decrypted_data = decrypt_request_data(encrypted_data, g.aes_key)
+        target_account = decrypted_data.get('account')
+        
+        if not target_account:
+            raise SecurityException("Missing target account", 400)
+        
+        # 读取用户文件并更新角色
+        users = []
+        user_found = False
+        
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, 'r') as f:
+                for line in f:
+                    try:
+                        user = json.loads(line)
+                        if user.get('account') == target_account:
+                            user['role'] = ADMIN_ROLE
+                            user_found = True
+                        users.append(user)
+                    except json.JSONDecodeError:
+                        continue
+        
+        if not user_found:
+            raise SecurityException("User not found", 404)
+        
+        # 写回用户文件
+        with open(USERS_FILE, 'w') as f:
+            for user in users:
+                f.write(json.dumps(user) + '\n')
+        
+        # 更新活跃token中的角色
+        for token_data in TOKENS.values():
+            if token_data.get('account') == target_account:
+                token_data['role'] = ADMIN_ROLE
+        
+        log_query(superadmin_account, "superadmin_activate_admin", {"target_account": target_account}, 1, client_ip)
+        logging.info(f"Super admin {superadmin_account} activated admin privileges for user {target_account}")
+        
+        response_data = {"data": {"message": f"User {target_account} has been activated as admin"}}
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except SecurityException as se:
+        raise
+    except Exception as e:
+        logging.error(f"Activate admin failed: {str(e)}", exc_info=True)
+        raise SecurityException("Activate admin process failed", 500)
+
+# 超级管理员功能：拉黑IP
+@app.route('/api/superadmin/blacklist-ip', methods=['POST'])
+@require_auth
+@require_token
+@require_superadmin
+def blacklist_ip():
+    """拉黑IP地址"""
+    try:
+        superadmin_account = g.account
+        client_ip = g.client_ip
+        
+        # 解密请求数据
+        encrypted_data = request.json.get('data')
+        if not encrypted_data:
+            raise SecurityException("Missing encrypted data", 400)
+        
+        decrypted_data = decrypt_request_data(encrypted_data, g.aes_key)
+        target_ip = decrypted_data.get('ip')
+        action = decrypted_data.get('action', 'add')  # add or remove
+        
+        if not target_ip:
+            raise SecurityException("Missing target IP", 400)
+        
+        # 验证IP格式
+        if not is_valid_ip(target_ip):
+            raise SecurityException("Invalid IP format", 400)
+        
+        if action == 'add':
+            BLACKLIST_IPS.add(target_ip)
+            message = f"IP {target_ip} has been blacklisted"
+            log_action = "superadmin_blacklist_ip_add"
+        elif action == 'remove':
+            BLACKLIST_IPS.discard(target_ip)
+            message = f"IP {target_ip} has been removed from blacklist"
+            log_action = "superadmin_blacklist_ip_remove"
+        else:
+            raise SecurityException("Invalid action", 400)
+        
+        # 保存黑名单
+        save_blacklist_ips()
+        
+        log_query(superadmin_account, log_action, {"target_ip": target_ip}, 1, client_ip)
+        logging.info(f"Super admin {superadmin_account} {action}ed IP {target_ip} to/from blacklist")
+        
+        response_data = {"data": {"message": message}}
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except SecurityException as se:
+        raise
+    except Exception as e:
+        logging.error(f"Blacklist IP failed: {str(e)}", exc_info=True)
+        raise SecurityException("Blacklist IP process failed", 500)
+
+# 获取黑名单IP列表
+@app.route('/api/superadmin/blacklist-ips', methods=['GET'])
+@require_auth
+@require_token
+@require_superadmin
+def get_blacklist_ips():
+    """获取黑名单IP列表"""
+    try:
+        superadmin_account = g.account
+        client_ip = g.client_ip
+        
+        log_query(superadmin_account, "superadmin_get_blacklist_ips", {}, len(BLACKLIST_IPS), client_ip)
+        
+        response_data = {"data": {"blacklist_ips": list(BLACKLIST_IPS)}}
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except SecurityException as se:
+        raise
+    except Exception as e:
+        logging.error(f"Get blacklist IPs failed: {str(e)}", exc_info=True)
+        raise SecurityException("Get blacklist IPs process failed", 500)
+
 if __name__ == '__main__':
     load_or_generate_rsa_keys()
+    # 加载黑名单IP
+    load_blacklist_ips()
     # 创建一个示例的 users.json 如果它不存在，防止首次运行时读取错误
     if not os.path.exists(USERS_FILE):
         with open(USERS_FILE, 'w') as f:
