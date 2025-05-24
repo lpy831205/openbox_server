@@ -1912,13 +1912,10 @@ def activate_admin():
         superadmin_account = g.account
         client_ip = g.client_ip
         
-        # 解密请求数据
-        encrypted_data = request.json.get('data')
-        if not encrypted_data:
-            raise SecurityException("Missing encrypted data", 400)
-        
-        decrypted_data = decrypt_request_data(encrypted_data, g.aes_key)
-        target_account = decrypted_data.get('account')
+        # 请求数据已由装饰器解密
+        if not g.decrypted_request_data:
+            raise SecurityException("Missing decrypted data", 400)
+        target_account = g.decrypted_request_data.get('account')
         
         if not target_account:
             raise SecurityException("Missing target account", 400)
@@ -1979,14 +1976,11 @@ def blacklist_ip():
         superadmin_account = g.account
         client_ip = g.client_ip
         
-        # 解密请求数据
-        encrypted_data = request.json.get('data')
-        if not encrypted_data:
-            raise SecurityException("Missing encrypted data", 400)
-        
-        decrypted_data = decrypt_request_data(encrypted_data, g.aes_key)
-        target_ip = decrypted_data.get('ip')
-        action = decrypted_data.get('action', 'add')  # add or remove
+        # 请求数据已由装饰器解密
+        if not g.decrypted_request_data:
+            raise SecurityException("Missing decrypted data", 400)
+        target_ip = g.decrypted_request_data.get('ip')
+        action = g.decrypted_request_data.get('action', 'add')  # add or remove
         
         if not target_ip:
             raise SecurityException("Missing target IP", 400)
