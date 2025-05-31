@@ -7,6 +7,7 @@ import re
 import secrets
 import time
 import ipaddress
+import shutil
 from datetime import datetime, timedelta
 from difflib import get_close_matches
 from functools import wraps
@@ -20,10 +21,64 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+# 添加passlib用于安全密码哈希
+from passlib.hash import argon2
+
+# 全局缓存变量
+QUERY_RECORDS_CACHE = {
+    "data": [],
+    "last_modified": 0
+}
+
+# 加载查询记录，使用缓存提高效率
+def load_query_records():
+    global QUERY_RECORDS_CACHE
+    
+    if not os.path.exists(QUERY_RECORDS_FILE):
+        return []
+        
+    # 获取文件最后修改时间
+    file_mtime = os.path.getmtime(QUERY_RECORDS_FILE)
+    
+    # 如果缓存有效，直接返回缓存数据
+    if QUERY_RECORDS_CACHE["last_modified"] == file_mtime and QUERY_RECORDS_CACHE["data"]:
+        return QUERY_RECORDS_CACHE["data"]
+    
+    # 缓存无效，重新加载数据
+    records = []
+    try:
+        with open(QUERY_RECORDS_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    records.append(record)
+                except json.JSONDecodeError:
+                    continue
+                    
+        # 更新缓存
+        QUERY_RECORDS_CACHE["data"] = records
+        QUERY_RECORDS_CACHE["last_modified"] = file_mtime
+        
+        logging.info(f"查询记录缓存已更新，加载了 {len(records)} 条记录")
+        return records
+    except Exception as e:
+        logging.error(f"加载查询记录失败: {str(e)}")
+        return []
 
 # 初始化Flask应用
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": "*"}})
+# 更安全的CORS配置
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173", "https://ldfmidleschool.com"],  # 限制允许的源
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Encrypted-Key", "X-Signature", 
+                         "X-Nonce", "X-Timestamp", "X-Client-IP"],
+        "expose_headers": ["Content-Type", "Content-Length"],
+        "supports_credentials": True,
+        "max_age": 600  # 10分钟的预检请求缓存
+    }
+})
 
 # 配置常量
 RSA_KEY_SIZE = 3072
@@ -31,6 +86,8 @@ PRIVATE_KEY_FILE = "private_key.pem"
 PUBLIC_KEY_FILE = "public_key.pem"
 AES_KEY_SIZE = 32  # 256-bit
 AES_IV_SIZE = 16  # 128-bit
+# 添加密钥加密密码环境变量名
+KEY_PASSWORD_ENV = "RSA_KEY_PASSWORD"
 
 # 安全配置常量
 MAX_LOGIN_ATTEMPTS = 5  # 最大登录尝试次数
@@ -39,11 +96,13 @@ RATE_LIMIT_REQUESTS = 100  # 每分钟最大请求数
 RATE_LIMIT_WINDOW = 60  # 速率限制时间窗口（秒）
 MAX_REQUEST_SIZE = 1024 * 1024  # 最大请求大小（1MB）
 SESSION_TIMEOUT = 3600  # 会话超时时间（秒）
-# DEVICE_CODE_REGEX = re.compile(r'^[0-9a-fA-F]{32}$') # Old regex
-DEVICE_CODE_REGEX = re.compile(r'^[0-9a-fA-F]{128}$')  # Updated for SHA3-512 (128 hex chars)
+DEVICE_CODE_REGEX = re.compile(r'^[0-9a-fA-F]{128}$')  # SHA3-512 (128 hex chars)
 LOG_FILE = "server.log"
 QUERY_RECORDS_FILE = "query_records.json"
 USERS_FILE = "users.json"
+BLACKLIST_IPS_FILE = "blacklist_ips.json"
+# 新增令牌存储文件
+TOKENS_FILE = "tokens.json"
 FIELD_MAPPING = {
     "_widget_1676622873142": "学期",
     "_widget_1676628877052": "报名时间",
@@ -66,14 +125,14 @@ FUZZY_THRESHOLD = 0.4
 # 初始化日志
 logging.basicConfig(
     filename=LOG_FILE,
-    level=logging.DEBUG,  # 输出所有级别的日志
+    level=logging.DEBUG,  # 修改为DEBUG级别，以便查看更详细的调试信息
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
 # 添加终端日志输出
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)  # 终端也输出DEBUG级别日志
+console_handler.setLevel(logging.DEBUG)  # 终端输出也设置为DEBUG级别
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(formatter)
 logging.getLogger().addHandler(console_handler)
@@ -84,11 +143,10 @@ public_key = None
 
 # Nonce缓存 (简单的内存实现，用于防重放)
 # 结构: {nonce_value: timestamp_ms}
-# 注意：在生产环境中，应使用更健壮的缓存方案（如Redis）并考虑分布式环境
 NONCE_CACHE = {}
 NONCE_CACHE_EXPIRY_MS = 5 * 60 * 1000  # 5分钟Nonce有效期
 
-# Token存储 (简单的内存实现)
+# Token存储 (文件系统实现，替代内存存储)
 # 结构: {token: {"account": str, "role": str, "expiry": datetime}}
 TOKENS = {}
 TOKEN_EXPIRY_MINUTES = 60  # Token有效期60分钟
@@ -101,6 +159,18 @@ login_attempts = defaultdict(list)  # IP地址 -> 登录尝试时间列表
 rate_limit_tracker = defaultdict(deque)  # IP地址 -> 请求时间队列
 blocked_ips = {}  # IP地址 -> 解封时间
 suspicious_activities = []  # 可疑活动记录
+blacklist_ips = set()  # 黑名单IP地址集合
+
+# 添加风控计数器
+SECURITY_VIOLATION_COUNTERS = {
+    "ip": {},  # 格式: {ip: {"count": 0, "last_violation": timestamp}}
+    "device_code": {}  # 格式: {device_code: {"count": 0, "last_violation": timestamp}}
+}
+
+# 风控阈值
+MAX_SECURITY_VIOLATIONS_IP = 2  # IP安全违规次数阈值
+MAX_INVITE_CODE_FAILURES = 3  # 邀请码错误次数阈值
+VIOLATION_RESET_TIME = 3600  # 违规计数器重置时间（秒）
 
 def is_valid_ip(ip_str):
     """验证IP地址格式是否有效
@@ -117,6 +187,39 @@ def is_valid_ip(ip_str):
     except ValueError:
         return False
 
+def get_client_ip():
+    """获取客户端真实IP地址
+    
+    尝试从各种HTTP头中获取真实的客户端IP地址
+    
+    Returns:
+        str: 客户端IP地址
+    """
+    # 首先检查X-Client-IP头（前端通过ipify API获取的公网IP）
+    x_client_ip = request.headers.get('X-Client-IP')
+    if x_client_ip and is_valid_ip(x_client_ip):
+        return x_client_ip
+    
+    # 然后检查X-Forwarded-For头
+    x_forwarded_for = request.headers.get('X-Forwarded-For')
+    if x_forwarded_for:
+        # 取列表中的第一个IP地址，即最初的客户端IP
+        ip = x_forwarded_for.split(',')[0].strip()
+        if is_valid_ip(ip):
+            return ip
+    
+    # 然后检查X-Real-IP头
+    x_real_ip = request.headers.get('X-Real-IP')
+    if x_real_ip and is_valid_ip(x_real_ip):
+        return x_real_ip
+    
+    # 最后使用请求的远程地址
+    if request.remote_addr and is_valid_ip(request.remote_addr):
+        return request.remote_addr
+    
+    # 如果都无法获取有效IP，返回未知
+    return '0.0.0.0'
+
 def check_rate_limit(client_ip):
     """检查客户端IP的请求速率限制
     
@@ -126,6 +229,11 @@ def check_rate_limit(client_ip):
     Returns:
         bool: 是否超过速率限制
     """
+    # 如果IP在黑名单中，直接拒绝
+    if client_ip in blacklist_ips:
+        logging.warning(f"拒绝来自黑名单IP的请求: {client_ip}")
+        return True
+        
     current_time = time.time()
     
     # 清理过期的请求记录
@@ -135,6 +243,7 @@ def check_rate_limit(client_ip):
     
     # 检查是否超过限制
     if len(rate_limit_tracker[client_ip]) >= RATE_LIMIT_REQUESTS:
+        logging.warning(f"IP {client_ip} 请求频率超限: {len(rate_limit_tracker[client_ip])}次/{RATE_LIMIT_WINDOW}秒")
         return True
     
     # 记录当前请求
@@ -204,6 +313,128 @@ def log_suspicious_activity(client_ip, activity_type, details):
         suspicious_activities.pop(0)
     
     logging.warning(f"可疑活动检测 - IP: {client_ip}, 类型: {activity_type}, 详情: {details}")
+
+def record_security_violation(ip, violation_type, device_code=None):
+    """记录安全违规
+    
+    Args:
+        ip: 客户端IP
+        violation_type: 违规类型
+        device_code: 设备码（可选）
+    """
+    current_time = time.time()
+    
+    # 记录IP违规
+    if violation_type in ["signature_mismatch", "timestamp_invalid", "nonce_reuse"]:
+        if ip not in SECURITY_VIOLATION_COUNTERS["ip"]:
+            SECURITY_VIOLATION_COUNTERS["ip"][ip] = {"count": 0, "last_violation": 0}
+            
+        # 检查是否需要重置计数器
+        if current_time - SECURITY_VIOLATION_COUNTERS["ip"][ip]["last_violation"] > VIOLATION_RESET_TIME:
+            SECURITY_VIOLATION_COUNTERS["ip"][ip]["count"] = 0
+            
+        # 增加计数
+        SECURITY_VIOLATION_COUNTERS["ip"][ip]["count"] += 1
+        SECURITY_VIOLATION_COUNTERS["ip"][ip]["last_violation"] = current_time
+        
+        # 检查是否达到阈值
+        if SECURITY_VIOLATION_COUNTERS["ip"][ip]["count"] >= MAX_SECURITY_VIOLATIONS_IP:
+            # 将IP加入黑名单
+            blacklist_ips.add(ip)
+            save_blacklist_ips()
+            logging.warning(f"IP {ip} 已被加入黑名单，原因：安全违规次数达到阈值 ({MAX_SECURITY_VIOLATIONS_IP})")
+            
+    # 记录设备码违规（邀请码错误）
+    if violation_type == "invite_code_failure" and device_code:
+        if device_code not in SECURITY_VIOLATION_COUNTERS["device_code"]:
+            SECURITY_VIOLATION_COUNTERS["device_code"][device_code] = {"count": 0, "last_violation": 0}
+            
+        # 检查是否需要重置计数器
+        if current_time - SECURITY_VIOLATION_COUNTERS["device_code"][device_code]["last_violation"] > VIOLATION_RESET_TIME:
+            SECURITY_VIOLATION_COUNTERS["device_code"][device_code]["count"] = 0
+            
+        # 增加计数
+        SECURITY_VIOLATION_COUNTERS["device_code"][device_code]["count"] += 1
+        SECURITY_VIOLATION_COUNTERS["device_code"][device_code]["last_violation"] = current_time
+        
+        # 检查是否达到阈值
+        if SECURITY_VIOLATION_COUNTERS["device_code"][device_code]["count"] >= MAX_INVITE_CODE_FAILURES:
+            # 将设备码加入黑名单
+            # 这里需要实现设备码黑名单机制
+            # 可以创建一个新的文件来存储被封禁的设备码
+            try:
+                with open("blocked_device_codes.json", "a+", encoding='utf-8') as f:
+                    f.seek(0)
+                    try:
+                        content = f.read()
+                        blocked_devices = json.loads(content) if content else []
+                    except json.JSONDecodeError:
+                        blocked_devices = []
+                    
+                    if device_code not in blocked_devices:
+                        blocked_devices.append(device_code)
+                        
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(blocked_devices, f)
+                    
+                logging.warning(f"设备码 {device_code} 已被封禁，原因：邀请码错误次数达到阈值 ({MAX_INVITE_CODE_FAILURES})")
+            except Exception as e:
+                logging.error(f"封禁设备码失败: {str(e)}")
+
+def validate_request_data():
+    """验证请求数据的安全性
+    
+    检查请求大小、内容类型等安全问题
+    
+    Returns:
+        bool: 请求是否安全
+    """
+    # 检查请求大小
+    content_length = request.content_length
+    if content_length and content_length > MAX_REQUEST_SIZE:
+        client_ip = get_client_ip()
+        log_suspicious_activity(client_ip, 'OVERSIZED_REQUEST', 
+                               f"请求大小: {content_length} bytes, 超过限制: {MAX_REQUEST_SIZE} bytes")
+        return False
+    
+    # 检查内容类型
+    if request.method in ['POST', 'PUT'] and request.content_type:
+        if not request.content_type.startswith(('application/json', 'multipart/form-data', 'application/x-www-form-urlencoded')):
+            client_ip = get_client_ip()
+            log_suspicious_activity(client_ip, 'INVALID_CONTENT_TYPE', 
+                                   f"不支持的内容类型: {request.content_type}")
+            return False
+    
+    # 检查路径注入
+    path = request.path
+    if '../' in path or '%2e%2e' in path.lower() or '\\' in path:
+        client_ip = get_client_ip()
+        log_suspicious_activity(client_ip, 'PATH_INJECTION', 
+                               f"可疑路径: {path}")
+        return False
+    
+    # 检查查询参数
+    for key, value in request.args.items():
+        # 检查SQL注入
+        if isinstance(value, str) and any(sql_pattern in value.lower() for sql_pattern in 
+                                         ['select ', 'union ', 'insert ', 'delete ', 'update ', 'drop ', 
+                                          'exec ', '--', '/*', '*/', '@@', '@variable', 'waitfor']):
+            client_ip = get_client_ip()
+            log_suspicious_activity(client_ip, 'SQL_INJECTION', 
+                                   f"可疑查询参数: {key}={value}")
+            return False
+        
+        # 检查XSS
+        if isinstance(value, str) and any(xss_pattern in value.lower() for xss_pattern in 
+                                         ['<script>', 'javascript:', 'onerror=', 'onload=', 'eval(', 
+                                          'document.cookie', 'alert(', 'onclick=']):
+            client_ip = get_client_ip()
+            log_suspicious_activity(client_ip, 'XSS_ATTEMPT', 
+                                   f"可疑XSS参数: {key}={value}")
+            return False
+    
+    return True
 
 def parse_class_query(class_query_str: str) -> str:
     """解析灵活格式的班级查询字符串
@@ -308,20 +539,72 @@ def load_or_generate_rsa_keys():
     global private_key, public_key
 
     try:
+        # 获取密钥加密密码
+        key_password = os.environ.get(KEY_PASSWORD_ENV)
+        if not key_password:
+            logging.warning(f"环境变量 {KEY_PASSWORD_ENV} 未设置，将使用默认密码")
+            # 使用服务器特定信息生成密码（如主机名+MAC地址哈希）
+            import uuid
+            import socket
+            machine_id = str(uuid.getnode()) + socket.gethostname()
+            key_password = hashlib.sha256(machine_id.encode()).hexdigest()[:32]
+        
+        key_password_bytes = key_password.encode('utf-8')  # 转换为字节
+
         if os.path.exists(PRIVATE_KEY_FILE) and os.path.exists(PUBLIC_KEY_FILE):
             with open(PRIVATE_KEY_FILE, "rb") as f:
-                private_key = serialization.load_pem_private_key(
-                    f.read(),
-                    password=None,
-                    backend=default_backend()
-                )
+                private_key_data = f.read()
+                
+            # 尝试判断私钥是否加密
+            is_encrypted = b"ENCRYPTED" in private_key_data
+            
+            if is_encrypted:
+                # 私钥已加密，使用密码加载
+                try:
+                    private_key = serialization.load_pem_private_key(
+                        private_key_data,
+                        password=key_password_bytes,
+                        backend=default_backend()
+                    )
+                    logging.info("已成功加载加密的RSA私钥")
+                except Exception as e:
+                    logging.error(f"无法加载加密私钥: {str(e)}")
+                    # 如果加载失败，可能是密码错误，尝试重新生成密钥
+                    logging.warning("尝试重新生成密钥对")
+                    os.remove(PRIVATE_KEY_FILE)
+                    os.remove(PUBLIC_KEY_FILE)
+                    # 递归调用自身，走生成新密钥的路径
+                    return load_or_generate_rsa_keys()
+            else:
+                # 私钥未加密，无需密码加载
+                try:
+                    private_key = serialization.load_pem_private_key(
+                        private_key_data,
+                        password=None,
+                        backend=default_backend()
+                    )
+                    logging.info("已加载未加密的RSA私钥，将重新保存为加密格式")
+                    
+                    # 重新保存为加密格式
+                    with open(PRIVATE_KEY_FILE, "wb") as f:
+                        f.write(private_key.private_bytes(
+                            encoding=serialization.Encoding.PEM,
+                            format=serialization.PrivateFormat.PKCS8,
+                            encryption_algorithm=serialization.BestAvailableEncryption(key_password_bytes)
+                        ))
+                    logging.info("RSA私钥已重新保存为加密格式")
+                except Exception as e:
+                    logging.error(f"无法加载未加密私钥: {str(e)}")
+                    raise
+                
             with open(PUBLIC_KEY_FILE, "rb") as f:
                 public_key = serialization.load_pem_public_key(
                     f.read(),
                     backend=default_backend()
                 )
-            logging.info("RSA keys loaded successfully")
+            logging.info("RSA密钥对加载成功")
         else:
+            logging.info("未找到RSA密钥文件，正在生成新的密钥对")
             private_key = rsa.generate_private_key(
                 public_exponent=65537,
                 key_size=RSA_KEY_SIZE,
@@ -329,13 +612,14 @@ def load_or_generate_rsa_keys():
             )
             public_key = private_key.public_key()
 
-            # 保存私钥
+            # 使用密码加密保存私钥
             with open(PRIVATE_KEY_FILE, "wb") as f:
                 f.write(private_key.private_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
+                    encryption_algorithm=serialization.BestAvailableEncryption(key_password_bytes)
                 ))
+            logging.info(f"RSA私钥已加密保存到 {PRIVATE_KEY_FILE}")
 
             # 保存公钥
             with open(PUBLIC_KEY_FILE, "wb") as f:
@@ -343,9 +627,9 @@ def load_or_generate_rsa_keys():
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PublicFormat.SubjectPublicKeyInfo
                 ))
-            logging.info("New RSA keys generated and saved")
+            logging.info(f"RSA公钥已保存到 {PUBLIC_KEY_FILE}")
     except Exception as e:
-        logging.critical(f"Failed to initialize RSA keys: {str(e)}")
+        logging.critical(f"初始化RSA密钥失败: {str(e)}")
         raise
 
 
@@ -387,6 +671,22 @@ def generate_invite_code(device_code):
 
 def log_query(account, action, query, result_count, ip):
     """记录查询日志"""
+    # 只记录以下操作：
+    # 1. 查询学生接口 (query_students)
+    # 2. 登录相关 (login_success, login_failed_*)
+    # 3. 注册相关 (register_success, register_failed_*)
+    # 4. 验证邀请码 (verify_invite_success, verify_invite_failed_*)
+    allowed_actions = [
+        "query_students",  # 查询学生
+        "login_success", "login_failed_password", "login_failed_not_found", "login_failed_device_mismatch",  # 登录相关
+        "register_success", "register_failed_invite_verification", "register_failed_account_exists", "register_failed_invalid_device_code_format", "register_failed_password_strength", "register_failed_storage_error",  # 注册相关
+        "verify_invite_success", "verify_invite_failed_signature", "verify_invite_failed_missing_fields", "verify_invite_failed_invalid_device_format"  # 验证邀请码相关
+    ]
+    
+    # 如果不是允许的操作，直接返回
+    if action not in allowed_actions:
+        return
+        
     record = {
         "timestamp": datetime.now().isoformat(),
         "account": account,
@@ -395,11 +695,50 @@ def log_query(account, action, query, result_count, ip):
         "query": query,
         "result_count": result_count
     }
+    
     try:
-        with open(QUERY_RECORDS_FILE, "a", encoding='utf-8') as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # 如果文件不存在或者是第一次写入，直接创建新文件
+        if not os.path.exists(QUERY_RECORDS_FILE) or os.path.getsize(QUERY_RECORDS_FILE) == 0:
+            with open(QUERY_RECORDS_FILE, "w", encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return
+            
+        # 读取现有记录，只保留允许的操作
+        existing_records = []
+        try:
+            with open(QUERY_RECORDS_FILE, "r", encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        existing_record = json.loads(line)
+                        if existing_record.get("action") in allowed_actions:
+                            existing_records.append(existing_record)
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logging.error(f"读取现有记录失败: {str(e)}")
+            
+        # 添加新记录
+        existing_records.append(record)
+        
+        # 按时间戳排序，最新的在前面
+        existing_records.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        
+        # 只保留最近的1000条记录
+        if len(existing_records) > 1000:
+            existing_records = existing_records[:1000]
+            
+        # 重写文件
+        with open(QUERY_RECORDS_FILE, "w", encoding='utf-8') as f:
+            for r in existing_records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                
+        # 更新缓存
+        global QUERY_RECORDS_CACHE
+        QUERY_RECORDS_CACHE["data"] = existing_records
+        QUERY_RECORDS_CACHE["last_modified"] = os.path.getmtime(QUERY_RECORDS_FILE)
+        
     except Exception as e:
-        logging.error(f"Failed to save query record: {str(e)}")
+        logging.error(f"保存查询记录失败: {str(e)}")
 
 
 def require_token(f):
@@ -444,7 +783,9 @@ def require_auth(f):
         client_sig = request.headers.get('X-Signature')
         client_nonce = request.headers.get('X-Nonce')
         client_timestamp_str = request.headers.get('X-Timestamp')
-        client_ip = request.headers.get('X-Client-IP', request.remote_addr)
+        
+        # 获取客户端真实IP地址，不再信任客户端提供的IP
+        client_ip = get_client_ip()
         
         # 安全检查
         if not is_valid_ip(client_ip):
@@ -452,7 +793,7 @@ def require_auth(f):
             raise SecurityException("Invalid IP address format", 400)
         
         # 检查IP是否在黑名单中
-        if client_ip in BLACKLIST_IPS:
+        if client_ip in blacklist_ips:
             log_suspicious_activity(client_ip, "blacklisted_access_attempt", "黑名单IP尝试访问")
             raise SecurityException("Access denied: IP is blacklisted", 403)
         
@@ -471,49 +812,75 @@ def require_auth(f):
         if content_length and content_length > MAX_REQUEST_SIZE:
             log_suspicious_activity(client_ip, "oversized_request", f"请求大小: {content_length} bytes")
             raise SecurityException("Request too large", 413)
+        
+        # 验证请求数据的安全性
+        if not validate_request_data():
+            log_suspicious_activity(client_ip, "invalid_request_data", "请求数据验证失败")
+            raise SecurityException("Invalid request data", 400)
 
-        # 调试输出请求头信息
-        logging.debug("\n===== 请求头信息 =====")
-        logging.debug(f"X-Encrypted-Key: {encrypted_key_b64}")
-        logging.debug(f"X-Signature: {client_sig}")
-        logging.debug(f"X-Nonce: {client_nonce}")
-        logging.debug(f"X-Timestamp: {client_timestamp_str}")
-        logging.debug(f"X-Client-IP: {client_ip}")
+        # 调试输出请求头信息（生产环境中应该禁用或降低详细程度）
+        if app.debug:
+            logging.debug("\n===== 请求头信息 =====")
+            logging.debug(f"X-Encrypted-Key: {encrypted_key_b64}")
+            logging.debug(f"X-Signature: {client_sig}")
+            logging.debug(f"X-Nonce: {client_nonce}")
+            logging.debug(f"X-Timestamp: {client_timestamp_str}")
+            logging.debug(f"Client IP: {client_ip}")
 
         if not all([encrypted_key_b64, client_sig, client_nonce, client_timestamp_str]):
             logging.warning(f"Missing auth headers from {client_ip}")
             raise SecurityException("Missing authentication headers", 401)
 
         try:
-            # 时间戳验证 (放宽到10秒窗口)
+            # 时间戳验证 (放宽到30秒窗口，更严格的时间检查)
             current_timestamp_ms = int(datetime.now().timestamp() * 1000)
             client_timestamp_ms = int(client_timestamp_str)
-            if abs(current_timestamp_ms - client_timestamp_ms) > 10000:  # 10 seconds
+            if abs(current_timestamp_ms - client_timestamp_ms) > 30000:  # 30 seconds
                 logging.warning(
                     f"Timestamp validation failed for {client_ip}. Server: {current_timestamp_ms}, Client: {client_timestamp_ms}")
-                raise SecurityException("Invalid timestamp (potential replay attack)", 401)
+                # 记录安全违规
+                record_security_violation(client_ip, "timestamp_invalid")
+                raise SecurityException("Invalid timestamp (potential replay attack)", 400)
 
             # Nonce 验证
             if client_nonce in NONCE_CACHE and current_timestamp_ms - NONCE_CACHE[client_nonce] < NONCE_CACHE_EXPIRY_MS:
                 logging.warning(f"Nonce reuse detected for {client_ip}. Nonce: {client_nonce}")
-                raise SecurityException("Nonce already used (potential replay attack)", 401)
+                # 记录可疑活动
+                log_suspicious_activity(client_ip, "nonce_reuse", f"Nonce重复使用: {client_nonce}")
+                # 记录安全违规
+                record_security_violation(client_ip, "nonce_reuse")
+                raise SecurityException("Nonce already used (potential replay attack)", 400)
 
             # 清理过期的Nonce
             keys_to_delete = [k for k, v in NONCE_CACHE.items() if current_timestamp_ms - v >= NONCE_CACHE_EXPIRY_MS]
             for k in keys_to_delete:
                 del NONCE_CACHE[k]
 
+            # 验证Nonce格式
+            if not re.match(r'^[a-f0-9]{64}$', client_nonce, re.IGNORECASE):
+                logging.warning(f"Invalid nonce format from {client_ip}: {client_nonce}")
+                raise SecurityException("Invalid nonce format", 400)
+
+            # 记录Nonce使用
             NONCE_CACHE[client_nonce] = current_timestamp_ms
 
             # 解密AES密钥
-            logging.debug("\n===== AES密钥解密 =====")
-            logging.debug(f"加密的AES密钥 (Base64): {encrypted_key_b64}")
-            aes_key_raw = base64.b64decode(private_key.decrypt(
-                base64.b64decode(encrypted_key_b64),
-                padding.PKCS1v15()
-            ))
-            logging.debug(f"解密后的AES密钥 (Hex): {aes_key_raw.hex()}")
-            aes_key_b64_for_sig = base64.b64encode(aes_key_raw).decode('utf-8')
+            try:
+                # 使用PSS填充方案进行解密
+                aes_key_raw = base64.b64decode(private_key.decrypt(
+                    base64.b64decode(encrypted_key_b64),
+                    padding.PKCS1v15()  # 使用PKCS1v15填充方案，与前端保持一致
+                ))
+                
+                # 验证AES密钥长度
+                if len(aes_key_raw) != AES_KEY_SIZE:
+                    logging.warning(f"Invalid AES key length from {client_ip}: {len(aes_key_raw)} bytes")
+                    raise SecurityException("Invalid AES key", 400)
+                    
+                aes_key_b64_for_sig = base64.b64encode(aes_key_raw).decode('utf-8')
+            except Exception as e:
+                logging.error(f"AES key decryption failed for {client_ip}: {str(e)}")
+                raise SecurityException("Failed to decrypt AES key", 400)
 
             # 获取请求数据
             path = request.path
@@ -526,10 +893,6 @@ def require_auth(f):
                 try:
                     # 对于非GET请求，如果请求体是JSON，则使用其UTF-8字符串形式
                     # 如果是加密的二进制数据，则使用其Base64编码形式
-                    # 这里的逻辑需要与客户端签名时如何处理requestBodyString保持一致
-                    # 假设客户端对于加密内容，requestBodyString是加密体的Base64
-                    # 假设客户端对于未加密JSON内容，requestBodyString是JSON字符串
-                    # 为了简化，我们先假设如果是非GET，且有body，则body是加密后base64编码的
                     if request_body_bytes:
                         # 尝试解码为json字符串，如果失败，则认为是加密数据，取base64
                         try:
@@ -539,14 +902,6 @@ def require_auth(f):
                 except Exception as e:
                     logging.debug(f"Error processing request_body_string for signature: {e}")
                     # 保留 request_body_string 为空字符串，或根据具体错误处理
-
-            logging.debug("\n===== 请求数据 (用于签名) =====")
-            logging.debug(f"请求路径 (path): {path}")
-            logging.debug(f"请求方法 (method): {method}")
-            logging.debug(f"请求体 (request_body_string): {request_body_string}")
-            logging.debug(f"AES密钥 (Base64 for sig): {aes_key_b64_for_sig}")
-            logging.debug(f"Nonce: {client_nonce}")
-            logging.debug(f"Timestamp: {client_timestamp_str}")
 
             # 计算服务器端签名 (SHA-256)
             # 规则: path + method + requestBodyString + aesKeyBase64 + nonce + timestamp
@@ -568,17 +923,25 @@ def require_auth(f):
             # 添加其他固定部分
             string_to_sign += f"{request_body_string_for_sig}{aes_key_b64_for_sig}{client_nonce}{client_timestamp_str}"
 
+            # 打印详细的签名参数，帮助排查问题
+            logging.debug(f"后端签名参数: path={path}, method={method}, body={request_body_string_for_sig}, aesKey={aes_key_b64_for_sig}, nonce={client_nonce}, timestamp={client_timestamp_str}")
+            logging.debug(f"后端签名字符串: {string_to_sign}")
+
+            # 使用SHA-256计算签名
             server_sig_calculated = hashlib.sha256(string_to_sign.encode('utf-8')).hexdigest()
+            
+            # 打印签名结果
+            logging.debug(f"后端计算的签名: {server_sig_calculated}, 客户端签名: {client_sig}")
 
-            logging.debug("\n===== 签名验证 =====")
-            logging.debug(f"待签名字符串: {string_to_sign}")
-            logging.debug(f"客户端签名 (X-Signature): {client_sig}")
-            logging.debug(f"服务器计算的签名: {server_sig_calculated}")
-
+            # 使用常量时间比较函数验证签名，防止时序攻击
             if not secrets.compare_digest(server_sig_calculated, client_sig):
                 logging.warning(
                     f"Signature mismatch for {client_ip}. Expected: {server_sig_calculated}, Got: {client_sig}")
-                raise SecurityException("Invalid signature", 401)
+                # 记录可疑活动
+                log_suspicious_activity(client_ip, "signature_mismatch", "签名验证失败")
+                # 记录安全违规
+                record_security_violation(client_ip, "signature_mismatch")
+                raise SecurityException("Invalid signature", 400)
 
             logging.info(f"Authentication successful for {client_ip} on path {path}")
 
@@ -589,7 +952,6 @@ def require_auth(f):
             # 如果是POST/PUT/PATCH请求并且有请求体，则解密
             g.decrypted_request_data = None
             if request.method in ['POST', 'PUT', 'PATCH'] and request_body_bytes:
-                logging.debug("\n===== 请求体解密 =====")
                 try:
                     # 先Base64解码请求体
                     decoded_body = base64.b64decode(request_body_bytes)
@@ -598,26 +960,26 @@ def require_auth(f):
                     iv_from_body = decoded_body[:AES_IV_SIZE]
                     encrypted_body_content = decoded_body[AES_IV_SIZE:]
 
-                    logging.debug(f"请求体IV (Hex): {iv_from_body.hex()}")
-                    logging.debug(f"加密的请求体内容长度: {len(encrypted_body_content)} bytes")
-                    logging.debug(f"完整的Base64解码后数据长度: {len(decoded_body)} bytes")
-
                     # 解密数据
                     decrypted_body_bytes = decrypt_aes(encrypted_body_content, aes_key_raw, iv_from_body)
-                    logging.debug(f"解密后的原始数据长度: {len(decrypted_body_bytes)}")
-                    logging.debug(f"解密后的原始数据(hex): {decrypted_body_bytes.hex()}")
 
                     # 尝试解析为JSON
                     g.decrypted_request_data = json.loads(decrypted_body_bytes.decode('utf-8'))
+                    
+                    # 验证解密后的数据结构
+                    if not isinstance(g.decrypted_request_data, dict):
+                        raise ValueError("Decrypted data is not a valid JSON object")
+                        
+                except json.JSONDecodeError:
+                    logging.error(f"JSON解析失败 - 来自 {client_ip}")
+                    raise SecurityException("Invalid JSON format in request data", 400)
                 except Exception as e:
                     logging.error(f"解密失败 - 错误详情: {str(e)}", exc_info=True)
                     raise SecurityException("Failed to decrypt request data", 400)
             elif request.method in ['GET', 'DELETE'] and request_body_string:
                 try:
                     g.decrypted_request_data = json.loads(request_body_string)
-                    logging.debug(f"GET/DELETE请求体 (未加密JSON): {g.decrypted_request_data}")
                 except json.JSONDecodeError:
-                    logging.debug(f"GET/DELETE请求体 (非JSON文本): {request_body_string}")
                     g.decrypted_request_data = request_body_string
 
         except HTTPException as e:
@@ -694,6 +1056,29 @@ def get_public_key():
         return jsonify({"error": "Failed to provide public key"}), 500
 
 
+def is_device_blocked(device_code):
+    """检查设备码是否被封禁
+    
+    Args:
+        device_code: 设备码
+        
+    Returns:
+        bool: 是否被封禁
+    """
+    try:
+        if not os.path.exists("blocked_device_codes.json"):
+            return False
+            
+        with open("blocked_device_codes.json", "r", encoding='utf-8') as f:
+            try:
+                blocked_devices = json.load(f)
+                return device_code in blocked_devices
+            except json.JSONDecodeError:
+                return False
+    except Exception as e:
+        logging.error(f"检查设备码封禁状态失败: {str(e)}")
+        return False
+
 @app.route('/api/verify_invite', methods=['POST'])
 @require_auth
 def verify_invite():
@@ -718,6 +1103,11 @@ def verify_invite():
             log_query(log_account_identifier, "verify_invite_failed_invalid_device_format",
                       {"device_code": device_code}, 0, client_ip)
             raise SecurityException("Invalid device code format", 400)
+            
+        # 检查设备码是否被封禁
+        if is_device_blocked(device_code):
+            log_suspicious_activity(client_ip, "blocked_device_access_attempt", f"被封禁的设备码尝试访问: {device_code}")
+            raise SecurityException("设备已被封禁", 403)
 
         # 验证签名
         try:
@@ -737,6 +1127,8 @@ def verify_invite():
                 f"Invite code verification failed for device_code {device_code} from IP {client_ip}: {str(e)}")
             log_query(log_account_identifier, "verify_invite_failed_signature", {"device_code": device_code}, 0,
                       client_ip)
+            # 记录邀请码验证失败
+            record_security_violation(client_ip, "invite_code_failure", device_code)
             raise SecurityException("Invite code verification failed", 403)
 
         # 邀请码验证成功
@@ -880,6 +1272,11 @@ def handle_register():
                       {"account": account, "device_code": device_code}, 0, client_ip)
             raise SecurityException("无效设备码格式", 400)
             
+        # 检查设备码是否被封禁
+        if is_device_blocked(device_code):
+            log_suspicious_activity(client_ip, "blocked_device_registration_attempt", f"被封禁的设备码尝试注册: {device_code}")
+            raise SecurityException("设备已被封禁", 403)
+
         # 验证密码强度
         if not re.match(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z\d]{6,}$', password):
             log_query(account, "register_failed_password_strength",
@@ -898,13 +1295,11 @@ def handle_register():
                 ),
                 hashes.SHA256()
             )
-            logging.info(
-                f"Invite code successfully verified for device_code: {device_code} during registration for account: {account}")
         except Exception as e:
-            logging.warning(
-                f"Invite code verification failed for device_code {device_code} during registration for account {account}: {str(e)}")
             log_query(account, "register_failed_invite_verification", {"account": account, "device_code": device_code},
                       0, client_ip)
+            # 记录邀请码验证失败
+            record_security_violation(client_ip, "invite_code_failure", device_code)
             raise SecurityException("邀请码验证失败", 403)
 
         # 检查用户是否已存在
@@ -927,7 +1322,7 @@ def handle_register():
 
         user_data = {
             'account': account,
-            'password_hash': hashlib.sha256(password.encode('utf-8')).hexdigest(),
+            'password_hash': hash_password(password),
             'device_code': device_code,  # Store the device_code used for registration
             'role': user_role,
             'register_time': datetime.now().isoformat(),
@@ -995,7 +1390,7 @@ def handle_login():
         for user in users:
             if user.get('account') == account:
                 user_found = True
-                if user.get('password_hash') == hashlib.sha256(password.encode()).hexdigest():
+                if verify_password(password, user.get('password_hash')):
                     # 验证设备码绑定
                     if user.get('device_code') != device_code_from_request:
                         log_query(account, "login_failed_device_mismatch", {"account": account}, 0, client_ip)
@@ -1022,7 +1417,17 @@ def handle_login():
                         logging.error(f"更新用户登录信息失败: {str(e)}")
                         # 继续处理，不影响登录流程
 
-                    # 生成访问令牌
+                    # 先清除该账户的所有现有token
+                    tokens_to_remove = []
+                    for token_key, token_data in TOKENS.items():
+                        if token_data.get("account") == account:
+                            tokens_to_remove.append(token_key)
+                    
+                    for token_key in tokens_to_remove:
+                        del TOKENS[token_key]
+                        logging.info(f"删除账户 {account} 的旧令牌以确保一个账户只有一个有效令牌")
+
+                    # 生成新的访问令牌
                     token = secrets.token_urlsafe(32)
                     expiry_time = datetime.now() + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
 
@@ -1034,6 +1439,9 @@ def handle_login():
                         "device_code": device_code_from_request,
                         "role": user_role
                     }
+                    
+                    # 持久化保存令牌
+                    save_tokens()
 
                     # 构建用户信息对象，与前端期望格式一致
                     user_info = {
@@ -1079,226 +1487,6 @@ def handle_login():
         raise SecurityException("登录过程发生错误", 500)
 
 
-@app.route('/api/auth/update-password', methods=['POST'])
-@require_auth
-@require_token
-def update_password():
-    """修改密码接口"""
-    try:
-        if not g.decrypted_request_data:
-            raise SecurityException("Missing password data in request body", 400)
-
-        old_password = g.decrypted_request_data.get('old_password')
-        new_password = g.decrypted_request_data.get('new_password')
-        account = g.account  # 从token中获取的账号
-        client_ip = g.client_ip
-
-        if not all([old_password, new_password]):
-            log_query(account, "update_password_failed_missing_fields", {"account": account}, 0, client_ip)
-            raise SecurityException("Missing required fields (old_password, new_password)", 400)
-
-        # 密码复杂度验证
-        if not re.match(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z\d]{6,}$', new_password):
-            log_query(account, "update_password_failed_complexity", {"account": account}, 0, client_ip)
-            raise SecurityException("New password does not meet complexity requirements", 400)
-
-        # 验证用户凭证
-        users = []
-        user_found = False
-        user_index = -1
-
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, 'r') as f:
-                for i, line in enumerate(f):
-                    try:
-                        user = json.loads(line)
-                        users.append(user)
-                        if user.get('account') == account:
-                            user_found = True
-                            user_index = i
-                    except json.JSONDecodeError:
-                        logging.warning(f"Skipping malformed line in {USERS_FILE}: {line.strip()}")
-
-        if not user_found:
-            log_query(account, "update_password_failed_user_not_found", {"account": account}, 0, client_ip)
-            raise SecurityException("User not found", 404)
-
-        # 验证旧密码
-        if users[user_index].get('password_hash') != hashlib.sha256(old_password.encode()).hexdigest():
-            log_query(account, "update_password_failed_wrong_password", {"account": account}, 0, client_ip)
-            raise SecurityException("Current password is incorrect", 401)
-
-        # 更新密码
-        users[user_index]['password_hash'] = hashlib.sha256(new_password.encode()).hexdigest()
-
-        # 写回文件
-        with open(USERS_FILE, 'w') as f:
-            for user in users:
-                f.write(json.dumps(user) + '\n')
-
-        log_query(account, "update_password_success", {"account": account}, 1, client_ip)
-
-        response_data = {
-            "status": "success",
-            "message": "密码修改成功"
-        }
-
-        # 加密响应数据
-        response_data_bytes = json.dumps(response_data).encode('utf-8')
-        iv = os.urandom(AES_IV_SIZE)
-        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
-        full_response_body = iv + encrypted_response_content
-
-        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
-
-    except SecurityException as se:
-        raise
-    except Exception as e:
-        logging.error(f"修改密码异常: {str(e)}", exc_info=True)
-        raise SecurityException("修改密码过程发生错误", 500)
-
-
-@app.route('/api/auth/check-token', methods=['POST'])
-def check_token():
-    """检查token是否有效（不需要认证装饰器）"""
-    try:
-        client_ip = request.headers.get('X-Client-IP', request.remote_addr)
-        
-        # 获取请求头中的token
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({
-                "valid": False,
-                "message": "Missing or invalid Authorization header"
-            }), 401
-
-        token = auth_header[7:]  # 去掉'Bearer '前缀
-
-        # 验证token
-        if token not in TOKENS:
-            return jsonify({
-                "valid": False,
-                "message": "Invalid or expired token"
-            }), 401
-
-        token_data = TOKENS[token]
-        current_time = datetime.now()
-        
-        if current_time > token_data["expiry"]:
-            # 清理过期token
-            del TOKENS[token]
-            return jsonify({
-                "valid": False,
-                "message": "Token expired"
-            }), 401
-
-        # Token有效，返回剩余时间
-        remaining_seconds = int((token_data["expiry"] - current_time).total_seconds())
-        
-        return jsonify({
-            "valid": True,
-            "message": "Token is valid",
-            "expires_in": remaining_seconds,
-            "account": token_data["account"],
-            "role": token_data.get("role", USER_ROLE)
-        })
-        
-    except Exception as e:
-        logging.error(f"Token check failed: {str(e)}")
-        return jsonify({
-            "valid": False,
-            "message": "Token check failed"
-        }), 500
-
-
-@app.route('/api/auth/refresh-token', methods=['POST'])
-@require_auth
-@require_token
-def refresh_token():
-    """刷新令牌接口"""
-    try:
-        account = g.account
-        device_code = g.device_code
-        client_ip = g.client_ip
-        old_token = request.headers.get('Authorization')[7:]  # 去掉'Bearer '前缀
-
-        # 生成新的访问令牌
-        new_token = secrets.token_urlsafe(32)
-        expiry_time = datetime.now() + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
-
-        # 存储新token
-        # 获取用户角色以存储在token中
-        current_user_role = USER_ROLE # 默认角色
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, 'r') as f_users:
-                for line_user in f_users:
-                    try:
-                        u_data = json.loads(line_user)
-                        if u_data.get('account') == account:
-                            current_user_role = u_data.get('role', USER_ROLE)
-                            break
-                    except json.JSONDecodeError:
-                        continue
-
-        TOKENS[new_token] = {
-            "account": account,
-            "expiry": expiry_time,
-            "device_code": device_code,
-            "role": current_user_role
-        }
-
-        # 删除旧token
-        if old_token in TOKENS:
-            del TOKENS[old_token]
-
-        log_query(account, "refresh_token_success", {"account": account}, 1, client_ip)
-
-        # 构建用户信息对象，与前端期望格式一致
-        # 获取用户信息
-        user_info = None
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, 'r') as f:
-                for line in f:
-                    try:
-                        user = json.loads(line)
-                        if user.get('account') == account:
-                            user_info = {
-                                "account": account,
-                                "role": user.get('role', USER_ROLE), # 确保使用常量
-                                "registerTime": user.get('register_time', datetime.now().isoformat())
-                            }
-                            break
-                    except json.JSONDecodeError:
-                        continue
-
-        if not user_info:
-            user_info = {
-                "account": account,
-                "role": USER_ROLE, # 确保使用常量
-                "registerTime": datetime.now().isoformat()
-            }
-
-        response_data = {
-            "token": new_token,
-            "expiry": expiry_time.isoformat(),
-            "user": user_info
-        }
-
-        # 加密响应数据
-        response_data_bytes = json.dumps(response_data).encode('utf-8')
-        iv = os.urandom(AES_IV_SIZE)
-        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
-        full_response_body = iv + encrypted_response_content
-
-        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
-
-    except SecurityException as se:
-        raise
-    except Exception as e:
-        logging.error(f"刷新令牌异常: {str(e)}", exc_info=True)
-        raise SecurityException("刷新令牌过程发生错误", 500)
-
-
 @app.route('/api/auth/updatekey', methods=['POST'])
 @require_auth
 @require_token
@@ -1332,7 +1520,7 @@ def update_key():
         raise SecurityException("更新密钥过程发生错误", 500)
 
 
-@app.route('/api/auth/login-records', methods=['GET'])
+@app.route('/api/auth/login-records', methods=['GET', 'POST'])
 @require_auth
 @require_token
 def get_login_records():
@@ -1341,24 +1529,21 @@ def get_login_records():
         account = g.account
         client_ip = g.client_ip # 当前请求的IP，可能与记录中的IP不同
 
+        # 使用缓存加载所有记录
+        all_records = load_query_records()
+        
+        # 筛选当前账户的登录记录
         login_records = []
-        if os.path.exists(QUERY_RECORDS_FILE):
-            with open(QUERY_RECORDS_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                        # 筛选属于当前账户的登录尝试记录 (成功或失败)
-                        if record.get('account') == account and \
-                           ('login_success' == record.get('action') or 'login_failed' in record.get('action')):
-                            login_records.append({
-                                "time": record.get('timestamp'),
-                                "ip": record.get('ip'),
-                                "status": 'success' if 'login_success' == record.get('action') else 'failed',
-                                "reason": record.get('query', {}).get('reason', '') if 'login_failed' in record.get('action') else ''
-                            })
-                    except json.JSONDecodeError:
-                        logging.warning(f"Skipping malformed line in {QUERY_RECORDS_FILE}: {line.strip()}")
-                        continue
+        for record in all_records:
+            # 筛选属于当前账户的登录尝试记录 (成功或失败)
+            if record.get('account') == account and \
+               ('login_success' == record.get('action') or 'login_failed' in record.get('action')):
+                login_records.append({
+                    "time": record.get('timestamp'),
+                    "ip": record.get('ip'),
+                    "status": 'success' if 'login_success' == record.get('action') else 'failed',
+                    "reason": record.get('query', {}).get('reason', '') if 'login_failed' in record.get('action') else ''
+                })
         
         # 按时间倒序排序，最新的记录在前面
         login_records.sort(key=lambda x: x['time'], reverse=True)
@@ -1422,19 +1607,8 @@ def get_admin_logs():
         client_ip = g.client_ip
         log_query(account, "get_admin_logs", {"account": account}, 0, client_ip)
 
-        # 此处应实现查询管理员日志的逻辑
-        # 例如从 query_records.json 筛选管理员操作
-        admin_logs = []
-        if os.path.exists(QUERY_RECORDS_FILE):
-            with open(QUERY_RECORDS_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                        # 简单示例：可以根据action类型或特定用户角色筛选
-                        # 这里假设所有记录都可以被管理员查看，或者有更复杂的筛选逻辑
-                        admin_logs.append(record)
-                    except json.JSONDecodeError:
-                        continue
+        # 使用缓存加载所有记录
+        admin_logs = load_query_records()
         admin_logs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
 
         response_data = {"logs": admin_logs[:100]} # 示例：返回最近100条
@@ -1493,16 +1667,8 @@ def get_admin_logs_paginated():
 
         log_query(account, "get_admin_logs_paginated", {"account": account, "page": page, "size": size}, 0, client_ip)
 
-        all_logs = []
-        if os.path.exists(QUERY_RECORDS_FILE):
-            with open(QUERY_RECORDS_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                        all_logs.append(record)
-                    except json.JSONDecodeError:
-                        continue
-        
+        # 使用缓存加载所有记录
+        all_logs = load_query_records()
         all_logs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         
         total_logs = len(all_logs)
@@ -1652,7 +1818,7 @@ def admin_reset_password():
             log_query(admin_account, "admin_reset_password_failed_user_not_found", {"admin_account": admin_account, "target_account": target_account}, 0, client_ip)
             raise SecurityException(f"User {target_account} not found for password reset", 404)
 
-        users[user_index]['password_hash'] = hashlib.sha256(new_password.encode('utf-8')).hexdigest()
+        users[user_index]['password_hash'] = hash_password(new_password)
 
         with open(USERS_FILE, 'w', encoding='utf-8') as f:
             for user_data in users:
@@ -1786,50 +1952,58 @@ def admin_export_logs():
 @require_token
 @require_admin
 def admin_force_logout():
-
+    """管理员强制用户登出"""
     try:
-        admin_account = g.account # Admin performing the action
-        client_ip = g.client_ip
-
         if not g.decrypted_request_data:
-            raise SecurityException("Missing account in request body for force logout", 400)
-        
-        target_account_to_logout = g.decrypted_request_data.get('account')
-        if not target_account_to_logout:
-            log_query(admin_account, "admin_force_logout_failed_missing_account", {"admin_account": admin_account}, 0, client_ip)
-            raise SecurityException("Account to force logout is required", 400)
+            raise SecurityException("Missing data in request body", 400)
 
-        if target_account_to_logout == admin_account:
-            log_query(admin_account, "admin_force_logout_failed_self", {"admin_account": admin_account}, 0, client_ip)
-            raise SecurityException("Cannot force logout self via this endpoint.", 403)
+        target_account = g.decrypted_request_data.get('account')
+        client_ip = g.client_ip
+        admin_account = g.account
 
+        if not target_account:
+            raise SecurityException("Missing target account", 400)
+
+        # 查找该用户的所有令牌
         tokens_to_remove = []
-        for token_value, token_data in list(TOKENS.items()): # Iterate over a copy
-            if token_data.get("account") == target_account_to_logout:
-                tokens_to_remove.append(token_value)
-        
+        for token, data in TOKENS.items():
+            if data.get("account") == target_account:
+                tokens_to_remove.append(token)
+
         if not tokens_to_remove:
-            log_query(admin_account, "admin_force_logout_failed_no_active_session", {"admin_account": admin_account, "target_account": target_account_to_logout}, 0, client_ip)
-            raise SecurityException(f"No active session found for user {target_account_to_logout} to force logout.", 404)
+            # 用户可能没有活跃会话
+            response_data = {
+                "status": "success",
+                "message": f"用户 {target_account} 没有活跃会话"
+            }
+        else:
+            # 删除该用户的所有令牌
+            for token in tokens_to_remove:
+                del TOKENS[token]
+                
+            # 持久化保存令牌
+            save_tokens()
+                
+            logging.info(f"管理员 {admin_account} 强制登出用户 {target_account}")
+            
+            response_data = {
+                "status": "success",
+                "message": f"已强制登出用户 {target_account}，删除了 {len(tokens_to_remove)} 个会话"
+            }
 
-        for token_val in tokens_to_remove:
-            del TOKENS[token_val]
-            logging.info(f"Admin {admin_account} forced logout for user {target_account_to_logout} (token: {token_val[:8]}...)")
-        
-        log_query(admin_account, "admin_force_logout_success", {"admin_account": admin_account, "target_account": target_account_to_logout}, len(tokens_to_remove), client_ip)
-
-        response_data = {"data": {"message": f"User {target_account_to_logout} has been forced to log out from {len(tokens_to_remove)} session(s)."}}
+        # 加密响应数据
         response_data_bytes = json.dumps(response_data).encode('utf-8')
         iv = os.urandom(AES_IV_SIZE)
         encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
         full_response_body = iv + encrypted_response_content
+
         return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
 
     except SecurityException as se:
         raise
     except Exception as e:
-        logging.error(f"管理员强制下线异常: {str(e)}", exc_info=True)
-        raise SecurityException("管理员强制下线过程发生错误", 500)
+        logging.error(f"强制登出用户失败: {str(e)}", exc_info=True)
+        raise SecurityException("强制登出用户失败", 500)
 
 
 @app.route('/api/admin/system-status', methods=['GET'])
@@ -1867,39 +2041,58 @@ def get_system_status():
 
 @app.before_request
 def cleanup_expired_tokens():
-    """清理过期token"""
+    """清理过期的令牌"""
+    global TOKENS
+    
+    # 只在请求处理前执行，避免频繁IO
+    if request.endpoint == 'static' or request.path.startswith('/favicon'):
+        return
+        
     current_time = datetime.now()
-    expired_tokens = [token for token, data in TOKENS.items() if current_time > data["expiry"]]
-    for token in expired_tokens:
-        del TOKENS[token]
-    if expired_tokens:
-        logging.info(f"Cleaned up {len(expired_tokens)} expired tokens")
+    tokens_to_remove = []
+    
+    for token, data in TOKENS.items():
+        if current_time > data["expiry"]:
+            tokens_to_remove.append(token)
+            
+    if tokens_to_remove:
+        for token in tokens_to_remove:
+            del TOKENS[token]
+        # 只有在有过期令牌被删除时才写入文件
+        save_tokens()
+        logging.info(f"已清理 {len(tokens_to_remove)} 个过期令牌")
 
 
 # 黑名单IP存储
-BLACKLIST_IPS = set()
-BLACKLIST_FILE = "blacklist_ips.json"
+blacklist_ips = set()
+BLACKLIST_IPS_FILE = "blacklist_ips.json"
 
 # 加载黑名单IP
 def load_blacklist_ips():
     """加载黑名单IP"""
-    global BLACKLIST_IPS
+    global blacklist_ips
     try:
-        if os.path.exists(BLACKLIST_FILE):
-            with open(BLACKLIST_FILE, 'r') as f:
-                BLACKLIST_IPS = set(json.load(f))
+        if os.path.exists(BLACKLIST_IPS_FILE):
+            with open(BLACKLIST_IPS_FILE, 'r') as f:
+                blacklist_ips = set(json.load(f))
+                logging.info(f"已加载 {len(blacklist_ips)} 个黑名单IP地址")
+        else:
+            logging.warning(f"黑名单文件 {BLACKLIST_IPS_FILE} 不存在，将创建新文件")
+            with open(BLACKLIST_IPS_FILE, 'w') as f:
+                json.dump([], f)
     except Exception as e:
-        logging.error(f"Failed to load blacklist IPs: {str(e)}")
-        BLACKLIST_IPS = set()
+        logging.error(f"加载黑名单IP失败: {str(e)}")
+        blacklist_ips = set()
 
 # 保存黑名单IP
 def save_blacklist_ips():
     """保存黑名单IP"""
     try:
-        with open(BLACKLIST_FILE, 'w') as f:
-            json.dump(list(BLACKLIST_IPS), f)
+        with open(BLACKLIST_IPS_FILE, 'w') as f:
+            json.dump(list(blacklist_ips), f)
+            logging.info(f"已保存 {len(blacklist_ips)} 个黑名单IP地址")
     except Exception as e:
-        logging.error(f"Failed to save blacklist IPs: {str(e)}")
+        logging.error(f"保存黑名单IP失败: {str(e)}")
 
 # 超级管理员功能：激活管理员
 @app.route('/api/superadmin/activate-admin', methods=['POST'])
@@ -1990,11 +2183,11 @@ def blacklist_ip():
             raise SecurityException("Invalid IP format", 400)
         
         if action == 'add':
-            BLACKLIST_IPS.add(target_ip)
+            blacklist_ips.add(target_ip)
             message = f"IP {target_ip} has been blacklisted"
             log_action = "superadmin_blacklist_ip_add"
         elif action == 'remove':
-            BLACKLIST_IPS.discard(target_ip)
+            blacklist_ips.discard(target_ip)
             message = f"IP {target_ip} has been removed from blacklist"
             log_action = "superadmin_blacklist_ip_remove"
         else:
@@ -2030,9 +2223,9 @@ def get_blacklist_ips():
         superadmin_account = g.account
         client_ip = g.client_ip
         
-        log_query(superadmin_account, "superadmin_get_blacklist_ips", {}, len(BLACKLIST_IPS), client_ip)
+        log_query(superadmin_account, "superadmin_get_blacklist_ips", {}, len(blacklist_ips), client_ip)
         
-        response_data = {"data": {"blacklist_ips": list(BLACKLIST_IPS)}}
+        response_data = {"data": {"blacklist_ips": list(blacklist_ips)}}
         response_data_bytes = json.dumps(response_data).encode('utf-8')
         iv = os.urandom(AES_IV_SIZE)
         encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
@@ -2045,14 +2238,364 @@ def get_blacklist_ips():
         logging.error(f"Get blacklist IPs failed: {str(e)}", exc_info=True)
         raise SecurityException("Get blacklist IPs process failed", 500)
 
+# 超级管理员功能：设置自定义角色
+@app.route('/api/superadmin/set-custom-role', methods=['POST'])
+@require_auth
+@require_token
+@require_superadmin
+def set_custom_role():
+    """设置用户自定义角色"""
+    try:
+        superadmin_account = g.account
+        client_ip = g.client_ip
+        
+        # 请求数据已由装饰器解密
+        if not g.decrypted_request_data:
+            raise SecurityException("Missing decrypted data", 400)
+        
+        target_account = g.decrypted_request_data.get('account')
+        custom_role = g.decrypted_request_data.get('role')
+        
+        if not target_account or not custom_role:
+            raise SecurityException("Missing target account or custom role", 400)
+        
+        # 读取用户文件并更新角色
+        users = []
+        user_found = False
+        
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, 'r') as f:
+                for line in f:
+                    try:
+                        user = json.loads(line)
+                        if user.get('account') == target_account:
+                            user['role'] = custom_role
+                            user_found = True
+                        users.append(user)
+                    except json.JSONDecodeError:
+                        continue
+        
+        if not user_found:
+            raise SecurityException("User not found", 404)
+        
+        # 写回用户文件
+        with open(USERS_FILE, 'w') as f:
+            for user in users:
+                f.write(json.dumps(user) + '\n')
+        
+        # 更新活跃token中的角色
+        for token_data in TOKENS.values():
+            if token_data.get('account') == target_account:
+                token_data['role'] = custom_role
+        
+        log_query(superadmin_account, "superadmin_set_custom_role", 
+                 {"target_account": target_account, "custom_role": custom_role}, 1, client_ip)
+        logging.info(f"Super admin {superadmin_account} set custom role '{custom_role}' for user {target_account}")
+        
+        response_data = {"data": {"message": f"User {target_account} has been assigned custom role: {custom_role}"}}
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except SecurityException as se:
+        raise
+    except Exception as e:
+        logging.error(f"Set custom role failed: {str(e)}", exc_info=True)
+        raise SecurityException("Set custom role process failed", 500)
+
+@app.route('/api/admin/clear-logs', methods=['POST'])
+@require_auth
+@require_token
+@require_admin
+def admin_clear_logs():
+    """管理员清除日志接口"""
+    try:
+        admin_account = g.account
+        client_ip = g.client_ip
+        
+        # 获取请求参数
+        if not g.decrypted_request_data:
+            raise SecurityException("Missing request data", 400)
+            
+        log_type = g.decrypted_request_data.get('log_type', 'all')  # 日志类型：all, query, suspicious
+        
+        # 记录此操作
+        log_query(admin_account, "admin_clear_logs", {"admin_account": admin_account, "log_type": log_type}, 0, client_ip)
+        
+        result_message = ""
+        
+        # 根据日志类型清除不同的日志
+        if log_type in ['all', 'query']:
+            # 清除查询记录
+            if os.path.exists(QUERY_RECORDS_FILE):
+                # 备份原文件
+                backup_file = f"{QUERY_RECORDS_FILE}.bak.{int(time.time())}"
+                try:
+                    shutil.copy2(QUERY_RECORDS_FILE, backup_file)
+                    # 清空文件
+                    open(QUERY_RECORDS_FILE, 'w', encoding='utf-8').close()
+                    # 更新缓存
+                    global QUERY_RECORDS_CACHE
+                    QUERY_RECORDS_CACHE["data"] = []
+                    QUERY_RECORDS_CACHE["last_modified"] = os.path.getmtime(QUERY_RECORDS_FILE)
+                    result_message += "查询记录已清除并备份。"
+                except Exception as e:
+                    logging.error(f"清除查询记录失败: {str(e)}")
+                    raise SecurityException("清除查询记录失败", 500)
+                    
+        if log_type in ['all', 'suspicious']:
+            # 清除可疑活动记录
+            global suspicious_activities
+            suspicious_activities = []
+            result_message += "可疑活动记录已清除。"
+            
+        # 准备响应数据
+        response_data = {
+            "status": "success",
+            "message": result_message
+        }
+        
+        # 加密响应数据
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except SecurityException as se:
+        raise
+    except Exception as e:
+        logging.error(f"清除日志异常: {str(e)}", exc_info=True)
+        raise SecurityException("清除日志过程发生错误", 500)
+
+# 密码哈希函数
+def hash_password(password):
+    """使用Argon2id算法哈希密码
+    
+    Args:
+        password: 明文密码
+        
+    Returns:
+        str: 哈希后的密码
+    """
+    return argon2.using(
+        # 内存成本
+        memory_cost=65536,  # 64MB
+        # 时间成本
+        time_cost=3,        # 3次迭代
+        # 并行度
+        parallelism=4       # 4个并行线程
+    ).hash(password)
+
+def verify_password(password, password_hash):
+    """验证密码是否匹配哈希值
+    
+    Args:
+        password: 明文密码
+        password_hash: 存储的密码哈希
+        
+    Returns:
+        bool: 密码是否匹配
+    """
+    # 兼容旧的SHA-256哈希方法
+    if len(password_hash) == 64 and all(c in '0123456789abcdef' for c in password_hash.lower()):
+        # 这是旧的SHA-256哈希
+        return password_hash == hashlib.sha256(password.encode()).hexdigest()
+    
+    # 使用passlib的验证方法
+    return argon2.verify(password, password_hash)
+
+def load_tokens():
+    """从文件加载令牌数据"""
+    global TOKENS
+    
+    if not os.path.exists(TOKENS_FILE):
+        TOKENS = {}
+        # 创建空的令牌文件
+        try:
+            with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
+                json.dump({}, f)
+            logging.info(f"创建了新的令牌文件 {TOKENS_FILE}")
+        except Exception as e:
+            logging.error(f"创建令牌文件失败: {str(e)}")
+        return
+    
+    try:
+        with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
+            tokens_data = json.load(f)
+            
+        # 转换过期时间字符串为datetime对象
+        TOKENS = {}
+        for token, data in tokens_data.items():
+            if "expiry" in data:
+                data["expiry"] = datetime.fromisoformat(data["expiry"])
+                TOKENS[token] = data
+        logging.info(f"成功加载了 {len(TOKENS)} 个令牌")
+    except Exception as e:
+        logging.error(f"加载令牌数据失败: {str(e)}")
+        TOKENS = {}
+
+def save_tokens():
+    """保存令牌数据到文件"""
+    try:
+        # 创建临时数据结构，将datetime转换为ISO格式字符串
+        tokens_to_save = {}
+        for token, data in TOKENS.items():
+            token_data = data.copy()
+            if isinstance(token_data["expiry"], datetime):
+                token_data["expiry"] = token_data["expiry"].isoformat()
+            tokens_to_save[token] = token_data
+            
+        # 保存到临时文件，然后重命名，确保原子性写入
+        temp_file = f"{TOKENS_FILE}.tmp"
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(tokens_to_save, f, ensure_ascii=False, indent=2)
+                
+            # 在Windows上，可能需要先删除目标文件
+            if os.path.exists(TOKENS_FILE):
+                try:
+                    os.remove(TOKENS_FILE)
+                except PermissionError:
+                    logging.warning(f"无法删除目标文件 {TOKENS_FILE}，可能正在被其他进程使用")
+                    # 在Windows上可能需要等待一下
+                    time.sleep(0.1)
+                    os.remove(TOKENS_FILE)
+                
+            os.rename(temp_file, TOKENS_FILE)
+            logging.info(f"成功保存了 {len(TOKENS)} 个令牌到 {TOKENS_FILE}")
+        except Exception as e:
+            logging.error(f"保存令牌数据到临时文件或重命名失败: {str(e)}")
+            # 尝试直接写入目标文件
+            with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(tokens_to_save, f, ensure_ascii=False, indent=2)
+            logging.info(f"通过直接写入方式成功保存了 {len(TOKENS)} 个令牌")
+    except Exception as e:
+        logging.error(f"保存令牌数据失败: {str(e)}", exc_info=True)
+
+@app.route('/api/auth/refresh-token', methods=['POST'])
+@require_auth
+@require_token
+def refresh_token():
+    """刷新令牌接口"""
+    try:
+        # 从g对象中获取当前用户信息
+        current_account = g.account
+        current_device_code = g.device_code
+        current_role = g.role
+        client_ip = g.client_ip
+        
+        # 获取当前令牌
+        auth_header = request.headers.get('Authorization')
+        current_token = auth_header[7:]  # 去掉'Bearer '前缀
+        
+        # 生成新的令牌
+        new_token = secrets.token_urlsafe(32)
+        expiry_time = datetime.now() + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
+        
+        # 存储新令牌
+        TOKENS[new_token] = {
+            "account": current_account,
+            "expiry": expiry_time,
+            "device_code": current_device_code,
+            "role": current_role
+        }
+        
+        # 删除旧令牌
+        if current_token in TOKENS:
+            del TOKENS[current_token]
+            
+        # 持久化保存令牌
+        save_tokens()
+        
+        # 记录令牌刷新操作
+        log_query(current_account, "token_refresh", {"account": current_account}, 1, client_ip)
+        
+        # 构建响应数据
+        response_data = {
+            "token": new_token,
+            "expiry": expiry_time.isoformat(),
+            "user": {
+                "account": current_account,
+                "role": current_role
+            }
+        }
+        
+        # 加密响应数据
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except Exception as e:
+        logging.error(f"刷新令牌失败: {str(e)}", exc_info=True)
+        raise SecurityException("令牌刷新失败", 500)
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@require_auth
+@require_token
+def handle_logout():
+    """用户登出接口"""
+    try:
+        # 从g对象中获取当前用户信息
+        current_account = g.account
+        client_ip = g.client_ip
+        
+        # 获取当前令牌
+        auth_header = request.headers.get('Authorization')
+        current_token = auth_header[7:]  # 去掉'Bearer '前缀
+        
+        # 删除令牌
+        if current_token in TOKENS:
+            del TOKENS[current_token]
+            # 持久化保存令牌
+            save_tokens()
+            
+        # 记录登出操作
+        log_query(current_account, "logout_success", {"account": current_account}, 1, client_ip)
+        
+        # 构建响应数据
+        response_data = {
+            "status": "success",
+            "message": "登出成功"
+        }
+        
+        # 加密响应数据
+        response_data_bytes = json.dumps(response_data).encode('utf-8')
+        iv = os.urandom(AES_IV_SIZE)
+        encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
+        full_response_body = iv + encrypted_response_content
+        
+        return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
+        
+    except Exception as e:
+        logging.error(f"登出失败: {str(e)}", exc_info=True)
+        raise SecurityException("登出失败", 500)
+
 if __name__ == '__main__':
+    # 加载RSA密钥
     load_or_generate_rsa_keys()
+    
     # 加载黑名单IP
     load_blacklist_ips()
-    # 创建一个示例的 users.json 如果它不存在，防止首次运行时读取错误
+    
+    # 加载令牌
+    load_tokens()
+    
+    # 确保用户文件存在
     if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'w') as f:
-            pass  # Create an empty file
-        logging.info(f"{USERS_FILE} created as it did not exist.")
-
-    app.run(host='0.0.0.0', port=5000, debug=False)
+        try:
+            with open(USERS_FILE, 'w', encoding='utf-8') as f:
+                pass  # 创建空文件
+            logging.info(f"创建了新的用户文件 {USERS_FILE}")
+        except Exception as e:
+            logging.error(f"创建用户文件失败: {str(e)}")
+    
+    # 启动服务器
+    app.run(debug=True, host='0.0.0.0', port=5000)
