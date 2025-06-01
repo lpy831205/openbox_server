@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 # 添加passlib用于安全密码哈希
@@ -29,6 +29,79 @@ QUERY_RECORDS_CACHE = {
     "data": [],
     "last_modified": 0
 }
+
+# 安全监控相关全局变量
+login_attempts = defaultdict(list)  # 记录失败的登录尝试
+failed_login_accounts = {}  # 记录失败登录的账号信息
+suspicious_activities = []  # 记录可疑活动
+system_logs = []  # 系统日志
+security_stats = {
+    "totalFailedLogins": 0,
+    "totalSuspiciousActivities": 0,
+    "blockedIpCount": 0,
+    "lastUpdated": datetime.now().isoformat()
+}
+
+# 从查询记录文件中恢复失败登录记录
+def restore_failed_logins_from_records():
+    """从查询记录文件中恢复失败登录记录
+    
+    在服务器启动时调用此函数，从query_records.json文件中恢复login_attempts和failed_login_accounts数据
+    """
+    global login_attempts, failed_login_accounts, security_stats
+    
+    if not os.path.exists(QUERY_RECORDS_FILE):
+        logging.info(f"查询记录文件 {QUERY_RECORDS_FILE} 不存在，跳过恢复失败登录记录")
+        return
+    
+    # 加载所有查询记录
+    all_records = []
+    try:
+        with open(QUERY_RECORDS_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    record = json.loads(line.strip())
+                    all_records.append(record)
+                except json.JSONDecodeError:
+                    logging.warning(f"恢复失败登录记录时，跳过格式错误的行: {line.strip()}")
+                    continue
+    except Exception as e:
+        logging.error(f"读取查询记录文件失败: {str(e)}")
+        return
+    
+    # 按IP分组记录
+    ip_records = defaultdict(list)
+    
+    # 遍历所有记录，找出登录失败的记录
+    for record in all_records:
+        if 'login_failed' in record.get('action', '') and record.get('ip'):
+            ip = record.get('ip')
+            account = record.get('account', 'unknown')
+            timestamp_str = record.get('timestamp')
+            
+            if timestamp_str:
+                try:
+                    # 将ISO格式的时间字符串转换为时间戳
+                    dt = datetime.fromisoformat(timestamp_str)
+                    timestamp = dt.timestamp()
+                    
+                    # 添加到login_attempts
+                    login_attempts[ip].append(timestamp)
+                    
+                    # 更新failed_login_accounts
+                    failed_login_accounts[ip] = account
+                    
+                    # 记录到IP分组
+                    ip_records[ip].append(record)
+                except (ValueError, TypeError):
+                    logging.warning(f"恢复失败登录记录时，时间戳格式错误: {timestamp_str}")
+    
+    # 更新安全统计
+    total_failed_logins = sum(len(attempts) for attempts in login_attempts.values())
+    security_stats["totalFailedLogins"] = total_failed_logins
+    security_stats["lastUpdated"] = datetime.now().isoformat()
+    
+    logging.info(f"从查询记录中恢复了 {total_failed_logins} 条失败登录记录，涉及 {len(login_attempts)} 个IP")
 
 # 加载查询记录，使用缓存提高效率
 def load_query_records():
@@ -65,8 +138,121 @@ def load_query_records():
         logging.error(f"加载查询记录失败: {str(e)}")
         return []
 
+# 加载用户数据
+def load_users():
+    """加载用户数据
+    
+    从用户文件中加载用户数据，如果文件不存在则创建
+    """
+    # 确保用户文件存在
+    if not os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump({}, f)
+            logging.info(f"创建了新的用户文件 {USERS_FILE}")
+        except Exception as e:
+            logging.error(f"创建用户文件失败: {str(e)}")
+    
+    # 加载用户数据，这里不创建全局变量，因为每次需要时都会重新读取
+    logging.info(f"用户文件已准备就绪: {USERS_FILE}")
+
+# 加载通知数据
+def load_notifications():
+    """加载通知数据
+    
+    从文件中加载通知数据
+    """
+    global NOTIFICATIONS
+    
+    if not os.path.exists(NOTIFICATIONS_FILE):
+        # 创建空的通知文件
+        try:
+            with open(NOTIFICATIONS_FILE, 'w', encoding='utf-8') as f:
+                json.dump([], f)
+            logging.info(f"创建了新的通知文件 {NOTIFICATIONS_FILE}")
+            NOTIFICATIONS = []
+            return
+        except Exception as e:
+            logging.error(f"创建通知文件失败: {str(e)}")
+            NOTIFICATIONS = []
+            return
+        
+    try:
+        with open(NOTIFICATIONS_FILE, 'r', encoding='utf-8') as f:
+            NOTIFICATIONS = json.load(f)
+            logging.info(f"成功加载 {len(NOTIFICATIONS)} 条通知")
+    except json.JSONDecodeError as e:
+        logging.error(f"通知文件JSON解析失败: {str(e)}")
+        # 备份损坏的文件
+        backup_file = f"{NOTIFICATIONS_FILE}.bak.{int(time.time())}"
+        try:
+            shutil.copy2(NOTIFICATIONS_FILE, backup_file)
+            logging.info(f"已备份损坏的通知文件到 {backup_file}")
+            # 重置为空数组
+            NOTIFICATIONS = []
+            with open(NOTIFICATIONS_FILE, 'w', encoding='utf-8') as f:
+                json.dump([], f)
+            logging.info("已重置通知文件为空数组")
+        except Exception as backup_error:
+            logging.error(f"备份通知文件失败: {str(backup_error)}")
+            NOTIFICATIONS = []
+    except Exception as e:
+        logging.error(f"加载通知失败: {str(e)}")
+        NOTIFICATIONS = []
+
+def save_notifications():
+    """保存通知数据
+    
+    将通知数据保存到文件中
+    """
+    try:
+        # 确保通知数据中的recipients字段格式正确
+        for notification in NOTIFICATIONS:
+            # 确保recipients字段是字符串"all"或者是列表
+            if 'recipients' in notification:
+                if notification['recipients'] != 'all' and not isinstance(notification['recipients'], list):
+                    # 如果格式不正确，转换为字符串
+                    notification['recipients'] = str(notification['recipients'])
+                    logging.warning(f"通知ID {notification.get('id', 'unknown')} 的recipients字段格式不正确，已转换为字符串")
+        
+        # 在保存前尝试序列化，检查是否有问题
+        try:
+            json_str = json.dumps(NOTIFICATIONS, ensure_ascii=False, indent=2)
+            logging.debug(f"通知数据序列化成功，长度: {len(json_str)} 字节")
+        except Exception as json_error:
+            logging.error(f"通知数据序列化失败: {str(json_error)}")
+            # 尝试找出问题所在
+            for i, notification in enumerate(NOTIFICATIONS):
+                try:
+                    json.dumps(notification, ensure_ascii=False)
+                except Exception as e:
+                    logging.error(f"通知 {i} 序列化失败: {str(e)}")
+                    # 尝试修复或移除有问题的通知
+                    NOTIFICATIONS[i] = {
+                        "id": notification.get("id", secrets.token_hex(16)),
+                        "sender": notification.get("sender", "system"),
+                        "recipients": "all",  # 使用安全的默认值
+                        "title": notification.get("title", "系统通知"),
+                        "content": notification.get("content", "此通知内容已丢失"),
+                        "create_time": notification.get("create_time", datetime.now().isoformat()),
+                        "is_read": {}
+                    }
+                    logging.warning(f"已修复通知 {i}")
+            
+            # 再次尝试序列化
+            json_str = json.dumps(NOTIFICATIONS, ensure_ascii=False, indent=2)
+        
+        # 保存到文件
+        with open(NOTIFICATIONS_FILE, 'w', encoding='utf-8') as f:
+            f.write(json_str)
+        logging.info(f"成功保存 {len(NOTIFICATIONS)} 条通知")
+    except Exception as e:
+        logging.error(f"保存通知失败: {str(e)}")
+        import traceback
+        logging.error(f"错误详情: {traceback.format_exc()}")
+
 # 初始化Flask应用
-app = Flask(__name__)
+app = Flask(__name__, static_folder='web_dist', static_url_path='')
 # 更安全的CORS配置
 CORS(app, resources={
     r"/api/*": {
@@ -88,6 +274,8 @@ AES_KEY_SIZE = 32  # 256-bit
 AES_IV_SIZE = 16  # 128-bit
 # 添加密钥加密密码环境变量名
 KEY_PASSWORD_ENV = "RSA_KEY_PASSWORD"
+# 添加通知文件
+NOTIFICATIONS_FILE = "notifications.json"
 
 # 安全配置常量
 MAX_LOGIN_ATTEMPTS = 5  # 最大登录尝试次数
@@ -154,11 +342,13 @@ SUPERADMIN_ROLE = 'superadmin'
 ADMIN_ROLE = 'admin'
 USER_ROLE = 'user'
 
+# 通知存储
+# 结构: [{"id": str, "sender": str, "recipients": list|str, "title": str, "content": str, "create_time": str, "is_read": dict}]
+NOTIFICATIONS = []
+
 # 安全监控全局变量
-login_attempts = defaultdict(list)  # IP地址 -> 登录尝试时间列表
 rate_limit_tracker = defaultdict(deque)  # IP地址 -> 请求时间队列
 blocked_ips = {}  # IP地址 -> 解封时间
-suspicious_activities = []  # 可疑活动记录
 blacklist_ips = set()  # 黑名单IP地址集合
 
 # 添加风控计数器
@@ -278,41 +468,64 @@ def check_login_attempts(client_ip):
     
     return False
 
-def record_failed_login(client_ip):
+def record_failed_login(client_ip, account="unknown", reason="未知原因"):
     """记录失败的登录尝试
     
     Args:
         client_ip: 客户端IP地址
+        account: 尝试登录的账号
+        reason: 登录失败的原因
     """
     current_time = time.time()
     login_attempts[client_ip].append(current_time)
+    
+    # 记录账号信息
+    failed_login_accounts[client_ip] = account
+    
+    # 更新安全统计
+    security_stats["totalFailedLogins"] += 1
+    security_stats["lastUpdated"] = datetime.now().isoformat()
+    
+    # 添加到系统日志
+    add_system_log("warning", f"登录失败 - IP: {client_ip}, 账号: {account}, 原因: {reason}", "auth-service")
     
     # 检查是否需要锁定
     if len(login_attempts[client_ip]) >= MAX_LOGIN_ATTEMPTS:
         blocked_ips[client_ip] = current_time + LOCKOUT_DURATION
         logging.warning(f"IP {client_ip} 已被锁定 {LOCKOUT_DURATION} 秒，原因：登录尝试次数过多")
+        # 记录为可疑活动
+        log_suspicious_activity(client_ip, "多次登录失败", f"账号: {account}, 尝试次数: {len(login_attempts[client_ip])}", "high")
 
-def log_suspicious_activity(client_ip, activity_type, details):
+def log_suspicious_activity(client_ip, activity_type, details, severity="medium"):
     """记录可疑活动
     
     Args:
         client_ip: 客户端IP地址
         activity_type: 活动类型
         details: 详细信息
+        severity: 严重程度 (low, medium, high, critical)
     """
     activity = {
         'timestamp': datetime.now().isoformat(),
         'ip': client_ip,
         'type': activity_type,
-        'details': details
+        'details': details,
+        'severity': severity
     }
     suspicious_activities.append(activity)
+    
+    # 更新安全统计
+    security_stats["totalSuspiciousActivities"] += 1
+    security_stats["lastUpdated"] = datetime.now().isoformat()
     
     # 保持最近1000条记录
     if len(suspicious_activities) > 1000:
         suspicious_activities.pop(0)
     
-    logging.warning(f"可疑活动检测 - IP: {client_ip}, 类型: {activity_type}, 详情: {details}")
+    # 添加到系统日志
+    add_system_log("warning", f"可疑活动检测 - IP: {client_ip}, 类型: {activity_type}", "security-service")
+    
+    logging.warning(f"可疑活动检测 - IP: {client_ip}, 类型: {activity_type}, 详情: {details}, 严重程度: {severity}")
 
 def record_security_violation(ip, violation_type, device_code=None):
     """记录安全违规
@@ -340,6 +553,7 @@ def record_security_violation(ip, violation_type, device_code=None):
         # 检查是否达到阈值
         if SECURITY_VIOLATION_COUNTERS["ip"][ip]["count"] >= MAX_SECURITY_VIOLATIONS_IP:
             # 将IP加入黑名单
+            global blacklist_ips
             blacklist_ips.add(ip)
             save_blacklist_ips()
             logging.warning(f"IP {ip} 已被加入黑名单，原因：安全违规次数达到阈值 ({MAX_SECURITY_VIOLATIONS_IP})")
@@ -363,20 +577,13 @@ def record_security_violation(ip, violation_type, device_code=None):
             # 这里需要实现设备码黑名单机制
             # 可以创建一个新的文件来存储被封禁的设备码
             try:
-                with open("blocked_device_codes.json", "a+", encoding='utf-8') as f:
-                    f.seek(0)
-                    try:
-                        content = f.read()
-                        blocked_devices = json.loads(content) if content else []
-                    except json.JSONDecodeError:
-                        blocked_devices = []
-                    
-                    if device_code not in blocked_devices:
-                        blocked_devices.append(device_code)
-                        
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(blocked_devices, f)
+                # 先更新全局变量
+                global blocked_device_codes
+                blocked_device_codes.add(device_code)
+                
+                # 然后更新文件
+                with open(BLOCKED_DEVICE_CODES_FILE, "w", encoding='utf-8') as f:
+                    json.dump(list(blocked_device_codes), f)
                     
                 logging.warning(f"设备码 {device_code} 已被封禁，原因：邀请码错误次数达到阈值 ({MAX_INVITE_CODE_FAILURES})")
             except Exception as e:
@@ -767,6 +974,13 @@ def require_token(f):
         g.account = token_data["account"]
         g.device_code = token_data["device_code"]
         g.role = token_data.get("role", USER_ROLE) # 从token中获取角色，默认为user
+        
+        # 添加g.user_data，用于通知功能
+        g.user_data = {
+            "account": token_data["account"],
+            "device_code": token_data["device_code"],
+            "role": token_data.get("role", USER_ROLE)
+        }
 
         return f(*args, **kwargs)
 
@@ -1065,19 +1279,218 @@ def is_device_blocked(device_code):
     Returns:
         bool: 是否被封禁
     """
+    # 先检查全局变量中是否存在
+    global blocked_device_codes
+    if device_code in blocked_device_codes:
+        return True
+        
+    # 如果全局变量中不存在，尝试从文件中加载
     try:
-        if not os.path.exists("blocked_device_codes.json"):
+        if not os.path.exists(BLOCKED_DEVICE_CODES_FILE):
             return False
             
-        with open("blocked_device_codes.json", "r", encoding='utf-8') as f:
+        with open(BLOCKED_DEVICE_CODES_FILE, "r", encoding='utf-8') as f:
             try:
-                blocked_devices = json.load(f)
-                return device_code in blocked_devices
+                loaded_blocked_devices = json.load(f)
+                # 更新全局变量
+                blocked_device_codes.update(loaded_blocked_devices)
+                return device_code in blocked_device_codes
             except json.JSONDecodeError:
                 return False
     except Exception as e:
         logging.error(f"检查设备码封禁状态失败: {str(e)}")
         return False
+
+# 添加系统日志函数
+def add_system_log(level, message, source="system"):
+    """添加系统日志
+    
+    Args:
+        level: 日志级别 (info, warning, error, debug)
+        message: 日志消息
+        source: 日志来源
+    """
+    log_entry = {
+        'timestamp': datetime.now().isoformat(),
+        'level': level,
+        'message': message,
+        'source': source
+    }
+    system_logs.append(log_entry)
+    
+    # 保持最近1000条记录
+    if len(system_logs) > 1000:
+        system_logs.pop(0)
+    
+    # 根据级别记录到日志文件
+    if level == "error":
+        logging.error(f"[{source}] {message}")
+    elif level == "warning":
+        logging.warning(f"[{source}] {message}")
+    elif level == "debug":
+        logging.debug(f"[{source}] {message}")
+    else:
+        logging.info(f"[{source}] {message}")
+
+# 获取安全监控数据 - 失败登录记录
+@app.route('/api/superadmin/security/failed-logins', methods=['GET'])
+@require_auth
+@require_token
+@require_superadmin
+def get_failed_logins():
+    """获取失败登录记录
+    
+    Returns:
+        JSON: 失败登录记录列表
+    """
+    # 格式化失败登录记录
+    failed_login_records = []
+    
+    # 先获取查询记录，用于补充失败原因信息
+    all_records = load_query_records()
+    
+    # 创建IP到最后失败原因的映射，按时间戳排序，确保获取最新的失败原因
+    ip_to_reason = {}
+    ip_to_records = {}
+    
+    # 首先按IP分组并收集所有相关记录
+    for record in all_records:
+        if 'login_failed' in record.get('action', '') and record.get('ip'):
+            ip = record.get('ip')
+            if ip not in ip_to_records:
+                ip_to_records[ip] = []
+            ip_to_records[ip].append(record)
+    
+    # 然后为每个IP找出最新的失败记录及其原因
+    for ip, records in ip_to_records.items():
+        # 按时间戳降序排序
+        sorted_records = sorted(records, key=lambda r: r.get('timestamp', ''), reverse=True)
+        for record in sorted_records:
+            reason = record.get('query', {}).get('reason')
+            if reason:
+                ip_to_reason[ip] = reason
+                break  # 找到第一个有原因的记录就停止
+    
+    for ip, attempts in login_attempts.items():
+        if attempts:
+            failed_login_records.append({
+                'ip': ip,
+                'attempts': len(attempts),
+                'lastAttempt': datetime.fromtimestamp(max(attempts)).isoformat(),
+                'account': failed_login_accounts.get(ip, 'unknown'),
+                'reason': ip_to_reason.get(ip, '未知原因')
+            })
+    
+    # 按尝试次数降序排序
+    failed_login_records.sort(key=lambda x: x['attempts'], reverse=True)
+    
+    # 记录系统日志
+    add_system_log("info", f"超级管理员查看失败登录记录", "security-service")
+    
+    return jsonify(failed_login_records)
+
+# 获取安全监控数据 - 可疑活动
+@app.route('/api/superadmin/security/suspicious-activities', methods=['GET'])
+@require_auth
+@require_token
+@require_superadmin
+def get_suspicious_activities():
+    """获取可疑活动记录
+    
+    Returns:
+        JSON: 可疑活动记录列表
+    """
+    # 记录系统日志
+    add_system_log("info", f"超级管理员查看可疑活动记录", "security-service")
+    
+    return jsonify(suspicious_activities)
+
+# 获取安全监控数据 - 系统日志
+@app.route('/api/superadmin/security/system-logs', methods=['GET'])
+@require_auth
+@require_token
+@require_superadmin
+def get_system_logs():
+    """获取系统日志
+    
+    Returns:
+        JSON: 系统日志列表
+    """
+    # 获取请求参数
+    limit = request.args.get('limit', default=100, type=int)
+    level = request.args.get('level', default=None, type=str)
+    
+    # 过滤日志
+    filtered_logs = system_logs
+    if level and level != 'all':
+        filtered_logs = [log for log in system_logs if log['level'] == level]
+    
+    # 限制返回数量
+    result_logs = filtered_logs[-limit:] if limit > 0 else filtered_logs
+    
+    # 记录系统日志
+    add_system_log("info", f"超级管理员查看系统日志", "security-service")
+    
+    return jsonify(result_logs)
+
+# 获取安全监控数据 - 安全统计
+@app.route('/api/superadmin/security/stats', methods=['GET'])
+@require_auth
+@require_token
+@require_superadmin
+def get_security_stats():
+    """获取安全统计数据
+    
+    Returns:
+        JSON: 安全统计数据
+    """
+    # 更新黑名单IP数量
+    try:
+        blacklist_ips_count = len(load_blacklist_ips())
+    except:
+        blacklist_ips_count = 0
+    
+    security_stats["blockedIpCount"] = blacklist_ips_count
+    security_stats["lastUpdated"] = datetime.now().isoformat()
+    
+    # 记录系统日志
+    add_system_log("info", f"超级管理员查看安全统计数据", "security-service")
+    
+    return jsonify(security_stats)
+
+# 清除失败登录记录
+@app.route('/api/superadmin/security/clear-failed-logins', methods=['POST'])
+@require_auth
+@require_token
+@require_superadmin
+def clear_failed_logins():
+    """清除失败登录记录
+    
+    Returns:
+        JSON: 操作结果
+    """
+    try:
+        data = request.get_json()
+        ip = data.get('ip')
+        
+        if ip:
+            # 清除指定IP的失败登录记录
+            if ip in login_attempts:
+                login_attempts[ip] = []
+                add_system_log("info", f"超级管理员清除了IP {ip} 的失败登录记录", "security-service")
+                return jsonify({"success": True, "message": f"IP {ip} 的失败登录记录已清除"})
+            else:
+                return jsonify({"success": False, "message": f"IP {ip} 没有失败登录记录"})
+        else:
+            # 清除所有失败登录记录
+            for ip in list(login_attempts.keys()):
+                login_attempts[ip] = []
+            
+            add_system_log("info", "超级管理员清除了所有失败登录记录", "security-service")
+            return jsonify({"success": True, "message": "所有失败登录记录已清除"})
+    except Exception as e:
+        add_system_log("error", f"清除失败登录记录时出错: {str(e)}", "security-service")
+        return jsonify({"success": False, "message": f"操作失败: {str(e)}"}), 500
 
 @app.route('/api/verify_invite', methods=['POST'])
 @require_auth
@@ -1393,8 +1806,8 @@ def handle_login():
                 if verify_password(password, user.get('password_hash')):
                     # 验证设备码绑定
                     if user.get('device_code') != device_code_from_request:
-                        log_query(account, "login_failed_device_mismatch", {"account": account}, 0, client_ip)
-                        record_failed_login(client_ip)
+                        log_query(account, "login_failed_device_mismatch", {"account": account, "reason": "设备码不匹配"}, 0, client_ip)
+                        record_failed_login(client_ip, account, "设备码不匹配")
                         log_suspicious_activity(client_ip, "failed_login", f"设备码不匹配 - 账号: {account}")
                         raise SecurityException("Device code does not match registered device", 403)
 
@@ -1423,14 +1836,15 @@ def handle_login():
                         if token_data.get("account") == account:
                             tokens_to_remove.append(token_key)
                     
+                    # 删除旧token
                     for token_key in tokens_to_remove:
                         del TOKENS[token_key]
                         logging.info(f"删除账户 {account} 的旧令牌以确保一个账户只有一个有效令牌")
-
+                    
                     # 生成新的访问令牌
                     token = secrets.token_urlsafe(32)
                     expiry_time = datetime.now() + timedelta(minutes=TOKEN_EXPIRY_MINUTES)
-
+                    
                     # 存储token
                     user_role = user.get('role', USER_ROLE) # 获取用户角色，默认为user
                     TOKENS[token] = {
@@ -1442,7 +1856,7 @@ def handle_login():
                     
                     # 持久化保存令牌
                     save_tokens()
-
+                    
                     # 构建用户信息对象，与前端期望格式一致
                     user_info = {
                         "account": account,
@@ -1455,28 +1869,28 @@ def handle_login():
                         "expiry": expiry_time.isoformat(),
                         "user": user_info
                     }
-
+                    
                     # 加密响应数据
                     response_data_bytes = json.dumps(response_data).encode('utf-8')
                     iv = os.urandom(AES_IV_SIZE)
                     encrypted_response_content = encrypt_data(response_data_bytes, g.aes_key, iv)
-
+ 
                     # IV需要和密文一起发送给客户端
                     full_response_body = iv + encrypted_response_content
-
+                    
                     # Base64编码整个响应体 (IV + 密文)
                     # 客户端需要先Base64解码，然后分离IV和密文进行解密
                     return jsonify({"data": base64.b64encode(full_response_body).decode('utf-8')})
                 else:
-                    log_query(account, "login_failed_password", {"account": account}, 0, client_ip)
-                    record_failed_login(client_ip)
+                    log_query(account, "login_failed_password", {"account": account, "reason": "密码错误"}, 0, client_ip)
+                    record_failed_login(client_ip, account, "密码错误")
                     log_suspicious_activity(client_ip, "failed_login", f"密码错误 - 账号: {account}")
                     raise SecurityException("Invalid account or password", 401)
 
         if not user_found:
-            log_query(account if account else "unknown_user", "login_failed_not_found", {"account": account}, 0,
+            log_query(account if account else "unknown_user", "login_failed_not_found", {"account": account, "reason": "账号不存在"}, 0,
                       client_ip)
-            record_failed_login(client_ip)
+            record_failed_login(client_ip, account if account else "unknown_user", "账号不存在")
             log_suspicious_activity(client_ip, "failed_login", f"账号不存在 - 账号: {account}")
             raise SecurityException("Invalid account or password", 401)
 
@@ -1538,11 +1952,16 @@ def get_login_records():
             # 筛选属于当前账户的登录尝试记录 (成功或失败)
             if record.get('account') == account and \
                ('login_success' == record.get('action') or 'login_failed' in record.get('action')):
+                # 获取失败原因，如果有的话
+                reason = ''
+                if 'login_failed' in record.get('action') and record.get('query', {}).get('reason'):
+                    reason = record.get('query', {}).get('reason')
+                
                 login_records.append({
                     "time": record.get('timestamp'),
                     "ip": record.get('ip'),
                     "status": 'success' if 'login_success' == record.get('action') else 'failed',
-                    "reason": record.get('query', {}).get('reason', '') if 'login_failed' in record.get('action') else ''
+                    "reason": reason
                 })
         
         # 按时间倒序排序，最新的记录在前面
@@ -1622,7 +2041,6 @@ def get_admin_logs():
     except Exception as e:
         logging.error(f"获取管理员日志异常: {str(e)}", exc_info=True)
         raise SecurityException("获取管理员日志过程发生错误", 500)
-
 
 # Admin routes
 @app.route('/api/admin/users/query', methods=['GET'])
@@ -1740,7 +2158,7 @@ def admin_get_online_users():
 @app.route('/api/admin/generate-invite', methods=['POST'])
 @require_auth
 @require_token
-@require_admin
+@require_superadmin
 def admin_generate_invite():
     try:
         admin_account = g.account # Admin account performing the action
@@ -2067,22 +2485,51 @@ def cleanup_expired_tokens():
 blacklist_ips = set()
 BLACKLIST_IPS_FILE = "blacklist_ips.json"
 
+# 封禁设备码存储
+blocked_device_codes = set()
+BLOCKED_DEVICE_CODES_FILE = "blocked_device_codes.json"
+
 # 加载黑名单IP
 def load_blacklist_ips():
     """加载黑名单IP"""
     global blacklist_ips
     try:
         if os.path.exists(BLACKLIST_IPS_FILE):
-            with open(BLACKLIST_IPS_FILE, 'r') as f:
-                blacklist_ips = set(json.load(f))
-                logging.info(f"已加载 {len(blacklist_ips)} 个黑名单IP地址")
+            try:
+                with open(BLACKLIST_IPS_FILE, 'r') as f:
+                    content = f.read().strip()
+                    # 检查文件是否为空或只包含空白字符
+                    if not content:
+                        logging.warning(f"黑名单文件 {BLACKLIST_IPS_FILE} 为空，将初始化为空数组")
+                        blacklist_ips = set()
+                        with open(BLACKLIST_IPS_FILE, 'w') as f:
+                            json.dump([], f)
+                    else:
+                        try:
+                            loaded_ips = json.loads(content)
+                            blacklist_ips = set(loaded_ips)
+                            logging.info(f"已加载 {len(blacklist_ips)} 个黑名单IP地址")
+                        except json.JSONDecodeError:
+                            logging.warning(f"黑名单文件 {BLACKLIST_IPS_FILE} 格式错误，将创建新文件")
+                            blacklist_ips = set()
+                            # 创建新文件
+                            with open(BLACKLIST_IPS_FILE, 'w') as f:
+                                json.dump([], f)
+            except Exception as e:
+                logging.error(f"读取黑名单文件失败: {str(e)}")
+                blacklist_ips = set()
+                # 创建新文件
+                with open(BLACKLIST_IPS_FILE, 'w') as f:
+                    json.dump([], f)
         else:
             logging.warning(f"黑名单文件 {BLACKLIST_IPS_FILE} 不存在，将创建新文件")
             with open(BLACKLIST_IPS_FILE, 'w') as f:
                 json.dump([], f)
+            blacklist_ips = set()
     except Exception as e:
         logging.error(f"加载黑名单IP失败: {str(e)}")
         blacklist_ips = set()
+    return blacklist_ips
 
 # 保存黑名单IP
 def save_blacklist_ips():
@@ -2093,6 +2540,41 @@ def save_blacklist_ips():
             logging.info(f"已保存 {len(blacklist_ips)} 个黑名单IP地址")
     except Exception as e:
         logging.error(f"保存黑名单IP失败: {str(e)}")
+
+# 加载封禁设备码
+def load_blocked_device_codes():
+    """加载封禁设备码"""
+    global blocked_device_codes
+    try:
+        if not os.path.exists(BLOCKED_DEVICE_CODES_FILE):
+            with open(BLOCKED_DEVICE_CODES_FILE, 'w', encoding='utf-8') as f:
+                json.dump([], f)
+            blocked_device_codes = set()
+            return
+            
+        with open(BLOCKED_DEVICE_CODES_FILE, 'r', encoding='utf-8') as f:
+            try:
+                blocked_codes = json.load(f)
+                blocked_device_codes = set(blocked_codes)
+                logging.info(f"已加载 {len(blocked_device_codes)} 个被封禁的设备码")
+            except json.JSONDecodeError:
+                logging.warning(f"封禁设备码文件 {BLOCKED_DEVICE_CODES_FILE} 格式错误，将创建新文件")
+                blocked_device_codes = set()
+                # 创建新文件
+                with open(BLOCKED_DEVICE_CODES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump([], f)
+    except Exception as e:
+        logging.error(f"加载封禁设备码失败: {str(e)}")
+        blocked_device_codes = set()
+
+# 保存封禁设备码
+def save_blocked_device_codes():
+    """保存封禁设备码"""
+    try:
+        with open(BLOCKED_DEVICE_CODES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(list(blocked_device_codes), f)
+    except Exception as e:
+        logging.error(f"保存封禁设备码失败: {str(e)}")
 
 # 超级管理员功能：激活管理员
 @app.route('/api/superadmin/activate-admin', methods=['POST'])
@@ -2409,33 +2891,29 @@ def verify_password(password, password_hash):
     return argon2.verify(password, password_hash)
 
 def load_tokens():
-    """从文件加载令牌数据"""
+    """加载Token数据
+    
+    从文件中加载Token数据，用于持久化会话管理
+    """
     global TOKENS
     
     if not os.path.exists(TOKENS_FILE):
         TOKENS = {}
-        # 创建空的令牌文件
-        try:
-            with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
-                json.dump({}, f)
-            logging.info(f"创建了新的令牌文件 {TOKENS_FILE}")
-        except Exception as e:
-            logging.error(f"创建令牌文件失败: {str(e)}")
         return
-    
+        
     try:
         with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
-            tokens_data = json.load(f)
+            data = json.load(f)
             
-        # 转换过期时间字符串为datetime对象
-        TOKENS = {}
-        for token, data in tokens_data.items():
-            if "expiry" in data:
-                data["expiry"] = datetime.fromisoformat(data["expiry"])
-                TOKENS[token] = data
-        logging.info(f"成功加载了 {len(TOKENS)} 个令牌")
+            # 转换过期时间字符串为datetime对象
+            for token, token_data in data.items():
+                if 'expiry' in token_data:
+                    token_data['expiry'] = datetime.fromisoformat(token_data['expiry'])
+            
+            TOKENS = data
+            logging.info(f"成功加载 {len(TOKENS)} 个token")
     except Exception as e:
-        logging.error(f"加载令牌数据失败: {str(e)}")
+        logging.error(f"加载token失败: {str(e)}")
         TOKENS = {}
 
 def save_tokens():
@@ -2578,24 +3056,453 @@ def handle_logout():
         logging.error(f"登出失败: {str(e)}", exc_info=True)
         raise SecurityException("登出失败", 500)
 
+@app.route('/api/admin/notifications/send', methods=['POST'])
+@require_auth
+@require_token
+@require_admin
+def admin_send_notification():
+    """管理员发送通知
+    
+    允许管理员向单个用户或所有用户发送通知
+    
+    Returns:
+        Response: 操作结果
+    """
+    try:
+        # 获取请求数据
+        data = g.decrypted_request_data
+        
+        # 记录接收到的数据，帮助调试
+        logging.debug(f"接收到的通知数据: {data}")
+        
+        # 验证必要参数
+        if not all(k in data for k in ['title', 'content', 'recipients']):
+            return jsonify({"success": False, "message": "缺少必要参数"}), 400
+            
+        title = data.get('title')
+        content = data.get('content')
+        recipients = data.get('recipients')  # 可以是用户列表或 "all"
+        
+        # 记录recipients的类型和值，帮助调试
+        logging.debug(f"recipients类型: {type(recipients)}, 值: {recipients}")
+        
+        # 验证数据格式
+        if not isinstance(title, str) or not title.strip():
+            return jsonify({"success": False, "message": "通知标题不能为空"}), 400
+            
+        if not isinstance(content, str) or not content.strip():
+            return jsonify({"success": False, "message": "通知内容不能为空"}), 400
+        
+        # 确保recipients是字符串"all"或列表类型
+        if recipients != "all":
+            # 如果不是"all"，确保是列表类型
+            if not isinstance(recipients, list):
+                logging.error(f"接收者格式不正确: {type(recipients)}, 值: {recipients}")
+                return jsonify({"success": False, "message": "接收者格式不正确，必须是'all'或用户列表"}), 400
+            
+            # 确保列表不为空
+            if len(recipients) == 0:
+                return jsonify({"success": False, "message": "接收者列表不能为空"}), 400
+                
+            # 确保列表中的所有元素都是字符串
+            if not all(isinstance(recipient, str) for recipient in recipients):
+                logging.error(f"接收者列表中存在非字符串元素: {recipients}")
+                return jsonify({"success": False, "message": "接收者列表中必须都是字符串"}), 400
+            
+        # 获取当前管理员账号
+        sender = g.user_data["account"]
+        
+        # 如果recipients是列表，验证用户是否存在
+        if recipients != "all":
+            # 加载用户数据
+            users_data = {}
+            if os.path.exists(USERS_FILE):
+                with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            user = json.loads(line)
+                            users_data[user.get('account')] = user
+                        except json.JSONDecodeError:
+                            continue
+                    
+            # 确认所有指定用户都存在
+            existing_accounts = set(users_data.keys())
+            for recipient in recipients:
+                if recipient not in existing_accounts:
+                    return jsonify({
+                        "success": False, 
+                        "message": f"用户 {recipient} 不存在"
+                    }), 404
+        
+        # 生成通知ID
+        notification_id = secrets.token_hex(16)
+        
+        # 创建通知记录
+        notification = {
+            "id": notification_id,
+            "sender": sender,
+            "recipients": recipients,
+            "title": title,
+            "content": content,
+            "create_time": datetime.now().isoformat(),
+            "is_read": {}  # 用于跟踪每个用户的已读状态
+        }
+        
+        # 添加到通知列表
+        NOTIFICATIONS.append(notification)
+        
+        # 保存通知数据
+        save_notifications()
+        
+        # 记录日志
+        if recipients == "all":
+            recipient_desc = "所有用户"
+        else:
+            recipient_desc = f"{len(recipients)}个用户"
+            
+        logging.info(f"管理员 {sender} 发送通知 '{title}' 给 {recipient_desc}")
+        
+        return jsonify({
+            "success": True,
+            "message": "通知发送成功",
+            "notification_id": notification_id
+        })
+        
+    except Exception as e:
+        logging.error(f"发送通知失败: {str(e)}")
+        # 添加更详细的错误信息
+        import traceback
+        logging.error(f"错误详情: {traceback.format_exc()}")
+        return jsonify({"success": False, "message": f"发送通知失败: {str(e)}"}), 500
+
+@app.route('/api/admin/notifications', methods=['GET'])
+@require_auth
+@require_token
+@require_admin
+def admin_get_notifications():
+    """管理员获取通知列表
+    
+    获取所有通知，包括已发送和接收的
+    
+    Returns:
+        Response: 通知列表
+    """
+    try:
+        # 获取分页参数
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('page_size', 10, type=int)
+        
+        # 获取当前管理员账号
+        current_user = g.user_data["account"]
+        
+        # 按创建时间倒序排序
+        sorted_notifications = sorted(
+            NOTIFICATIONS, 
+            key=lambda x: x.get('create_time', ''), 
+            reverse=True
+        )
+        
+        # 计算分页
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # 分页数据
+        paginated_data = sorted_notifications[start_idx:end_idx] if sorted_notifications else []
+        
+        # 添加已读状态
+        users_data = {}
+        if os.path.exists(USERS_FILE):
+            try:
+                with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                    users_data = json.load(f)
+            except json.JSONDecodeError:
+                logging.error("用户数据文件格式错误")
+                users_data = {}
+            except Exception as e:
+                logging.error(f"读取用户数据失败: {str(e)}")
+                users_data = {}
+        
+        for notification in paginated_data:
+            # 确保is_read字段存在
+            if 'is_read' not in notification:
+                notification['is_read'] = {}
+            
+            # 确保recipients字段格式正确
+            if 'recipients' in notification:
+                recipients = notification['recipients']
+                # 如果不是字符串"all"且不是列表，则转换为字符串
+                if recipients != 'all' and not isinstance(recipients, list):
+                    notification['recipients'] = str(recipients)
+                    logging.warning(f"通知ID {notification.get('id', 'unknown')} 的recipients字段格式不正确，已转换为字符串")
+                
+            # 为管理员视图添加已读计数
+            if notification.get('recipients') == 'all':
+                total_users = len(users_data)
+                read_count = len(notification.get('is_read', {}))
+                notification['read_count'] = read_count
+                notification['total_recipients'] = total_users if total_users > 0 else 0
+            else:
+                recipients = notification.get('recipients', [])
+                if isinstance(recipients, list):
+                    total_recipients = len(recipients)
+                    read_count = sum(1 for user in notification.get('is_read', {}) 
+                                if user in recipients)
+                    notification['read_count'] = read_count
+                    notification['total_recipients'] = total_recipients
+                else:
+                    # 处理recipients字段格式错误的情况
+                    notification['read_count'] = 0
+                    notification['total_recipients'] = 0
+                    logging.error(f"通知 {notification.get('id', 'unknown')} 的recipients字段格式错误")
+                
+        return jsonify({
+            "success": True,
+            "notifications": paginated_data,
+            "total": len(sorted_notifications),
+            "page": page,
+            "page_size": page_size
+        })
+        
+    except Exception as e:
+        logging.error(f"获取通知列表失败: {str(e)}")
+        return jsonify({"success": False, "message": f"获取通知列表失败: {str(e)}"}), 500
+
+@app.route('/api/notifications', methods=['GET'])
+@require_auth
+@require_token
+def get_user_notifications():
+    """获取用户的通知
+    
+    获取发给当前用户的所有通知
+    
+    Returns:
+        Response: 通知列表
+    """
+    try:
+        # 获取当前用户账号
+        current_user = g.user_data["account"]
+        
+        # 获取分页参数
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('page_size', 10, type=int)
+        
+        # 筛选发给当前用户的通知
+        user_notifications = []
+        
+        for notification in NOTIFICATIONS:
+            try:
+                # 获取recipients字段
+                recipients = notification.get('recipients')
+                
+                # 判断是否应该将通知添加到用户的通知列表中
+                should_add = False
+                
+                # 如果是发给所有用户的通知
+                if recipients == 'all':
+                    should_add = True
+                # 如果是发给特定用户的通知，且当前用户在接收列表中
+                elif isinstance(recipients, list) and current_user in recipients:
+                    should_add = True
+                
+                # 如果应该添加通知
+                if should_add:
+                    # 创建通知副本
+                    notification_copy = notification.copy()
+                    # 添加已读状态
+                    is_read_dict = notification.get('is_read', {})
+                    notification_copy['is_read'] = current_user in is_read_dict
+                    # 添加到用户的通知列表
+                    user_notifications.append(notification_copy)
+            except Exception as e:
+                logging.error(f"处理通知时出错: {str(e)}, 通知ID: {notification.get('id', 'unknown')}")
+                continue
+        
+        # 按创建时间倒序排序
+        sorted_notifications = sorted(
+            user_notifications, 
+            key=lambda x: x.get('create_time', ''), 
+            reverse=True
+        )
+        
+        # 计算分页
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # 分页数据
+        paginated_data = sorted_notifications[start_idx:end_idx] if sorted_notifications else []
+        
+        # 计算未读通知数
+        unread_count = sum(1 for n in user_notifications if not n.get('is_read', False))
+        
+        return jsonify({
+            "success": True,
+            "notifications": paginated_data,
+            "total": len(sorted_notifications),
+            "unread_count": unread_count,
+            "page": page,
+            "page_size": page_size
+        })
+        
+    except Exception as e:
+        logging.error(f"获取用户通知失败: {str(e)}")
+        return jsonify({"success": False, "message": f"获取用户通知失败: {str(e)}"}), 500
+
+@app.route('/api/notifications/read', methods=['POST'])
+@require_auth
+@require_token
+def mark_notification_read():
+    """标记通知为已读
+    
+    将指定通知标记为当前用户已读
+    
+    Returns:
+        Response: 操作结果
+    """
+    try:
+        # 获取请求数据
+        data = g.decrypted_request_data
+        
+        # 验证必要参数
+        if 'notification_id' not in data:
+            return jsonify({"success": False, "message": "缺少通知ID"}), 400
+            
+        notification_id = data.get('notification_id')
+        
+        # 获取当前用户账号
+        current_user = g.user_data["account"]
+        
+        # 查找通知
+        found = False
+        for notification in NOTIFICATIONS:
+            if notification.get('id') == notification_id:
+                # 确认通知是发给该用户的
+                recipients = notification.get('recipients')
+                
+                # 判断通知是否发给当前用户
+                is_recipient = False
+                
+                # 如果是发给所有用户的通知
+                if recipients == 'all':
+                    is_recipient = True
+                # 如果是发给特定用户的通知，且当前用户在接收列表中
+                elif isinstance(recipients, list) and current_user in recipients:
+                    is_recipient = True
+                
+                if is_recipient:
+                    # 标记为已读
+                    if 'is_read' not in notification:
+                        notification['is_read'] = {}
+                    notification['is_read'][current_user] = datetime.now().isoformat()
+                    found = True
+                break
+        
+        if not found:
+            return jsonify({"success": False, "message": "通知不存在或不是发给当前用户的"}), 404
+            
+        # 保存通知数据
+        save_notifications()
+        
+        return jsonify({
+            "success": True,
+            "message": "通知已标记为已读"
+        })
+        
+    except Exception as e:
+        logging.error(f"标记通知已读失败: {str(e)}")
+        return jsonify({"success": False, "message": f"标记通知已读失败: {str(e)}"}), 500
+
+@app.route('/api/admin/notifications/delete', methods=['POST'])
+@require_auth
+@require_token
+@require_admin
+def admin_delete_notification():
+    """管理员删除通知
+    
+    删除指定的通知
+    
+    Returns:
+        Response: 操作结果
+    """
+    try:
+        # 获取请求数据
+        data = g.decrypted_request_data
+        
+        # 验证必要参数
+        if 'notification_id' not in data:
+            return jsonify({"success": False, "message": "缺少通知ID"}), 400
+            
+        notification_id = data.get('notification_id')
+        
+        # 获取当前管理员账号
+        current_user = g.user_data["account"]
+        current_role = g.user_data["role"]
+        
+        # 查找并删除通知
+        found = False
+        for i, notification in enumerate(NOTIFICATIONS):
+            if notification.get('id') == notification_id:
+                # 确认是该管理员发送的通知或是超级管理员
+                if notification.get('sender') == current_user or current_role == SUPERADMIN_ROLE:
+                    del NOTIFICATIONS[i]
+                    found = True
+                else:
+                    return jsonify({"success": False, "message": "无权删除其他管理员发送的通知"}), 403
+                break
+        
+        if not found:
+            return jsonify({"success": False, "message": "通知不存在"}), 404
+            
+        # 保存通知数据
+        save_notifications()
+        
+        return jsonify({
+            "success": True,
+            "message": "通知已删除"
+        })
+        
+    except Exception as e:
+        logging.error(f"删除通知失败: {str(e)}")
+        return jsonify({"success": False, "message": f"删除通知失败: {str(e)}"}), 500
+    
+# 添加路由处理前端页面请求
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    try:
+        # 首先尝试直接提供请求的文件
+        if path and os.path.exists(os.path.join(app.static_folder, path)):
+            return send_from_directory(app.static_folder, path)
+        # 对于assets目录下的文件，尝试直接提供
+        elif path and path.startswith('assets/') and os.path.exists(os.path.join(app.static_folder, path)):
+            return send_from_directory(app.static_folder, path)
+        else:
+            # 对于所有其他路由，返回index.html（SPA应用需要）
+            return send_from_directory(app.static_folder, 'index.html')
+    except Exception as e:
+        logging.error(f"静态文件服务错误: {str(e)}")
+        return jsonify({"error": "静态文件服务错误"}), 500
+
+# 在应用启动时加载通知数据
+load_notifications()
+
+# 配置应用
 if __name__ == '__main__':
-    # 加载RSA密钥
-    load_or_generate_rsa_keys()
-    
-    # 加载黑名单IP
-    load_blacklist_ips()
-    
-    # 加载令牌
-    load_tokens()
-    
-    # 确保用户文件存在
-    if not os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, 'w', encoding='utf-8') as f:
-                pass  # 创建空文件
-            logging.info(f"创建了新的用户文件 {USERS_FILE}")
-        except Exception as e:
-            logging.error(f"创建用户文件失败: {str(e)}")
-    
-    # 启动服务器
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    try:
+        load_or_generate_rsa_keys()
+        load_users()
+        load_tokens()
+        load_blacklist_ips()
+        load_blocked_device_codes()  # 添加加载被阻止的设备码
+        load_notifications()  # 添加加载通知数据
+        
+        # 从查询记录中恢复失败登录记录
+        restore_failed_logins_from_records()
+        
+        app.run(host='0.0.0.0', port=5000, debug=True)
+    except Exception as e:
+        logging.error(f"应用启动失败: {str(e)}")
+        exit(1)
+
+
+
+
